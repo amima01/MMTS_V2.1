@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/Doc/">
+    <File Path="chats_2025-09-12.txt" />
+  </Folder>
+  <Folder Name="/Solution Items/">
+    <File Path="../REPO/MMTS/chats_2025-09-12.txt" />
+  </Folder>
+  <Project Path="MMTS/MMTS.fsproj" />
+  <Project Path="POC/POC.fsproj" />
+</Solution>
