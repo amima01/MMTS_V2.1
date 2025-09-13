@@ -1720,9 +1720,208 @@ Now the log would say e.g. top.workflow: expected scalar,
 got mapping (object) — instantly telling you the exact key.
 
 ///////////////////////////////////////////////////
+Great—thanks for pasting it. That YAML matches your parser exactly. 
+Nothing in it should trigger “Expected scalar, got seq.” 
+So if you’re still seeing that error, it’s almost certainly 
+loading a different file (older format) or a different path than you think.
+
+Here’s how to nail it down fast:
+1) Confirm the exact file being read
+
+Add this log (you already log a preview, but let’s be explicit):
+///////////////////////////////////////////////////
+let full = System.IO.Path.GetFullPath yamlPath
+Log.infof "Reading YAML from: %s" full
+...
+Compare that path to the file you just pasted.
+...
+2) Force a distinctive first line
+
+Put this comment as the first line of your YAML:
+# S0_MMTS_ML CURRENT v2025-09-13-TEST
+...
+When your app logs the first 40 lines, make sure you see that comment.
+If you don’t, you’re not reading the file you think you are.
+3) Quick sanity loader (isolated)
+
+Drop this tiny check somewhere (or run in F# Interactive) to ensure the loader parses this YAML text:
+
+///////////////////////////////////////////////////
+let yamlText = """
+# S0_MMTS_ML CURRENT v2025-09-13-TEST
+workflow: "S0_MMTS_ML"
+version:  "1.0"
+description: "S0 batch workflow"
+params:
+  envName:  "dev"
+  dbName:   "MMTS_DB"
+  connStr:  "Server=.;Database=MMTS_DB;Trusted_Connection=True;Encrypt=False"
+  hookNs:   "POC.Hooks"
+  impl:     "v1"
+  batchId:  "2025-09-13"
+  emitMode: "bulk_upsert"
+datasources:
+  default: { kind: "mssql", conn: "Server=.;Database=MMTS_DB;Trusted_Connection=True;Encrypt=False" }
+tables:
+  s0_out:   { ds: "default", name: "[dbo].[S0_Cadence31]" }
+hooks:
+  s0.fetch:     { module: "POC.Hooks.S0.Fetch.v1.Module", func: "Run", kind: "rows" }
+  s0.transform: { module: "POC.Hooks.S0.Transform.v1.Module", func: "Run", kind: "rows" }
+steps:
+  - id: s0.fetch
+    uses: "s0.fetch"
+    args: { batchId: "${params.batchId}" }
+    out:  { rows: "step:s0.fetch.rows" }
+  - id: s0.transform
+    uses: { module: "POC.Hooks.S0.Transform.v1.Module", func: "Run" }
+    in:   { rows: "step:s0.fetch.rows" }
+    args: { impl: "${params.impl}" }
+    out:  { rows: "step:s0.transform.rows" }
+validations:
+  - { id: v1, on: "step:s0.fetch.rows", rule: "nonempty" }
+  - { id: v2, on: "step:s0.transform.rows", rule: "schemaMatch(Symbol, Price, Ts, BatchId, PriceZ, Impl)" }
+materialize:
+  - from:  "step:s0.transform.rows"
+    to:    "table:s0_out"
+    mode:  "${params.emitMode}"
+    key:   ["Symbol","BatchId"]
+    pre_sql:  "DELETE FROM [dbo].[S0_Cadence31] WHERE BatchId = '${params.batchId}'"
+    post_sql: "EXEC [dbo].[sp_AuditLog] '${params.batchId}', '${params.envName}'"
+schedule: { cron: "0 0/5 * * * ?" }
+"""
+
+let spec0 = MMTS.ML.Parse.load yamlText   // should not throw
+let spec  = MMTS.ML.Parse.interpolateAll spec0
+printfn "OK: workflow=%s, steps=%d" spec.workflow spec.steps.Length
+
+///////////////////////////////////////////////////
+If that prints OK, the parser is fine; the problem is just which file your program is reading.
+
+4) Make error messages pinpoint the key
+
+If you still want extra clarity, update your Y.str helper 
+to show which field failed and what node type it saw:
+///////////////////////////////////////////////////
+module private Y =
+    let private kind (n:YamlNode) =
+        match n with
+        | :? YamlScalarNode -> "scalar"
+        | :? YamlMappingNode -> "mapping"
+        | :? YamlSequenceNode -> "sequence"
+        | _ -> n.GetType().Name
+
+    let strL (label:string) (n:YamlNode) =
+        match n with
+        | :? YamlScalarNode as s -> s.Value |> string
+        | _ -> failwithf "%s: expected scalar, got %s" label (kind n)
+
+    // then use strL in Parse.load for top-level keys:
+    let workflow    = strL "top.workflow"    root["workflow"]
+    let version     = strL "top.version"     root["version"]
+    let description = strL "top.description" root["description"]
+
+///////////////////////////////////////////////////
+Now errors read like top.workflow: expected scalar, got mapping, which is immediately actionable.
+
+5) Common gotchas to check
+
+Multiple files named similarly (e.g., S0_MMTS_ML.yaml vs S0_MMTS_ML.yml) in different folders.
+
+Running from a working directory that changes the relative path 
+(@"DOC\S0_MMTS_ML.yaml" may point somewhere else).
+
+VS “Copy to Output Directory” mismatch (if you’re reading from bin\...). 
+Prefer reading from the project folder using AppContext.BaseDirectory or Directory.GetCurrentDirectory() and logging the resolved absolute path.
+
+If you want, show me the log line that prints the full path 
+and the first 5 preview lines your app is reading; I’ll tell you immediately 
+whether it’s the right file or not.
+///////////////////////////////////////////////////
+can you give code to pretty-print from all roots to nodes?
+yes — if you want to debug your YAML parse deeply, the trick is to walk the YamlNode tree and pretty-print all roots down to leaves with indentation. That way you’ll see exactly where the parser sees a mapping instead of a scalar.
+
+Here’s a drop-in F# helper:
+///////////////////////////////////////////////////
+open System
+open YamlDotNet.RepresentationModel
+
+module YamlDebug =
+
+    let rec private dumpNode (indent:int) (node:YamlNode) =
+        let pad = String(' ', indent)
+        match node with
+        | :? YamlScalarNode as s ->
+            printfn "%s- SCALAR: %s" pad (if isNull s.Value then "<null>" else s.Value)
+        | :? YamlMappingNode as m ->
+            printfn "%s- MAPPING {" pad
+            for kv in m.Children do
+                let k = kv.Key :?> YamlScalarNode
+                printfn "%s  Key: %s" pad k.Value
+                dumpNode (indent+4) kv.Value
+            printfn "%s}" pad
+        | :? YamlSequenceNode as seq ->
+            printfn "%s- SEQUENCE [" pad
+            seq.Children
+            |> Seq.iteri (fun i child ->
+                printfn "%s  Item %d:" pad i
+                dumpNode (indent+4) child )
+            printfn "%s]" pad
+        | other ->
+            printfn "%s- UNKNOWN node type: %s" pad (other.GetType().FullName)
+
+    /// Pretty-print entire YAML document tree
+    let dumpYaml (yamlText:string) =
+        let ys = YamlStream()
+        ys.Load(new System.IO.StringReader(yamlText))
+        let doc = ys.Documents.[0]
+        printfn "ROOT DOCUMENT"
+        dumpNode 0 doc.RootNode
+
 ///////////////////////////////////////////////////
 
 ///////////////////////////////////////////////////
+
 ///////////////////////////////////////////////////
 
 ///////////////////////////////////////////////////
+
+///////////////////////////////////////////////////
+
+///////////////////////////////////////////////////
+
+///////////////////////////////////////////////////
+
+///////////////////////////////////////////////////
+
+///////////////////////////////////////////////////
+
+///////////////////////////////////////////////////
+
+///////////////////////////////////////////////////
+
+///////////////////////////////////////////////////
+
+///////////////////////////////////////////////////
+
+///////////////////////////////////////////////////
+
+///////////////////////////////////////////////////
+
+///////////////////////////////////////////////////
+
+///////////////////////////////////////////////////
+
+///////////////////////////////////////////////////
+
+///////////////////////////////////////////////////
+
+///////////////////////////////////////////////////
+
+///////////////////////////////////////////////////
+
+///////////////////////////////////////////////////
+
+///////////////////////////////////////////////////
+
+///////////////////////////////////////////////////
+

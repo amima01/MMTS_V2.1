@@ -1,4 +1,40 @@
 ﻿namespace POC
+open System
+open YamlDotNet.RepresentationModel
+
+
+module YamlDebug =
+
+    let rec private dumpNode (indent:int) (node:YamlNode) =
+        let pad = String(' ', indent)
+        match node with
+        | :? YamlScalarNode as s ->
+            printfn "%s- SCALAR: %s" pad (if isNull s.Value then "<null>" else s.Value)
+        | :? YamlMappingNode as m ->
+            printfn "%s- MAPPING {" pad
+            for kv in m.Children do
+                let k = kv.Key :?> YamlScalarNode
+                printfn "%s  Key: %s" pad k.Value
+                dumpNode (indent+4) kv.Value
+            printfn "%s}" pad
+        | :? YamlSequenceNode as seq ->
+            printfn "%s- SEQUENCE [" pad
+            seq.Children
+            |> Seq.iteri (fun i child ->
+                printfn "%s  Item %d:" pad i
+                dumpNode (indent+4) child )
+            printfn "%s]" pad
+        | other ->
+            printfn "%s- UNKNOWN node type: %s" pad (other.GetType().FullName)
+
+    /// Pretty-print entire YAML document tree
+    let dumpYaml (yamlText:string) =
+        let ys = YamlStream()
+        ys.Load(new System.IO.StringReader(yamlText))
+        let doc = ys.Documents.[0]
+        printfn "ROOT DOCUMENT"
+        dumpNode 0 doc.RootNode
+
 module Program =
     open System
     open System.IO
@@ -26,7 +62,11 @@ module Program =
                 Log.errorf "YAML not found at %s" (Path.GetFullPath yamlPath)
             else
                 let yaml =
-                    try File.ReadAllText yamlPath
+                    try 
+                        //File.ReadAllText yamlPath
+                        let yaml = File.ReadAllText yamlPath
+                        YamlDebug.dumpYaml yaml
+                        yaml
                     with ex ->
                         Log.errorf "Failed to read YAML: %s" ex.Message
                         raise ex
@@ -139,6 +179,11 @@ module Program =
         let yamlPath =
             let i = Array.FindIndex(argv, fun a -> a = "--yaml")
             if i >= 0 && i + 1 < argv.Length then argv.[i+1] else @"DOC\S0_MMTS_ML.yaml"
+
+        let full = System.IO.Path.GetFullPath yamlPath
+        Log.infof "Reading YAML from: %s" full
+        
+        
 
         Log.infof "Attempting YAML run: %s" (Path.GetFullPath yamlPath)
         runYamlOnce yamlPath
