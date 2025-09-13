@@ -1092,42 +1092,4 @@ module Runner =
         Exec.run env
         env // return env if caller wants to inspect stepRows
 
-    (*
-
-    module Schedule =
-        open Quartz
-        open Quartz.Impl
-
-        // NOTE: Delegates cannot be serialized; keep a factory in-memory.
-        let mutable private optionsFactory : (unit -> Options) = fun () -> failwith "Options factory not set"
-
-        type RunYamlJob() =
-            interface IJob with
-                member _.Execute(ctx: IJobExecutionContext) =
-                    let yaml = ctx.MergedJobDataMap.["yaml"] :?> string
-                    let opts = optionsFactory()
-                    runFromYaml yaml opts |> ignore
-                    System.Threading.Tasks.Task.CompletedTask
-
-        let start (yaml:string) (optFactory: unit -> Options) (cron:string) = task {
-            optionsFactory <- optFactory
-            let factory = new StdSchedulerFactory()
-            let! scheduler = factory.GetScheduler()
-            do! scheduler.Start()
-
-            let job =
-                JobBuilder.Create<RunYamlJob>()
-                    .WithIdentity("mmts_yaml_job", "mmts")
-                    .UsingJobData("yaml", yaml)
-                    .Build()
-
-            let trigger =
-                TriggerBuilder.Create()
-                    .WithIdentity("mmts_yaml_trigger", "mmts")
-                    .WithCronSchedule(cron)
-                    .Build()
-
-            do! scheduler.scheduleJob (job, trigger) |> Async.AwaitTask |> Async.StartAsTask
-        }
-
-*)
+    

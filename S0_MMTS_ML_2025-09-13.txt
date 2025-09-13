@@ -1,0 +1,48 @@
+workflow:
+  name: "S0_MMTS_ML"
+  kind: "batch"            # or "repl" for interactive mode
+  version: "1.0"
+
+  params:
+    env:      "dev"        # environment: dev | test | prod
+    db:       "MMTS_DB"    # database name
+    batchId:  "2025-09-13" # interpolation-friendly
+    impl:     "default"    # which impl variant
+
+  schedule:
+    # cron-style, Quartz.NET compatible
+    cron: "0 0 * * * ?"    # every hour
+
+  steps:
+    - id: "s0.fetch"
+      module: "POC.Hooks.S0.Fetch.v1.Module"
+      func:   "Run"
+      kind:   "rows"
+      foreach:
+        source: "Symbols"      # future: iterate over symbol list
+        degree_of_parallelism: 4
+
+    - id: "s0.transform"
+      module: "POC.Hooks.S0.Transform.v1.Module"
+      func:   "Run"
+      kind:   "rows"
+
+  validations:
+    - id: nonempty
+      target: "s0.fetch"
+      rule:   "rows.length > 0"
+    - id: schema
+      target: "s0.transform"
+      rule:   "columns == [A,B,C]"  # example schema check
+    - id: range
+      target: "s0.transform"
+      rule:   "C >= 0"
+    - id: unique
+      target: "s0.transform"
+      rule:   "unique(A,B)"
+
+  materialize:
+    mode: "bulk_upsert"
+    target: "[dbo].[S0_Cadence31]"
+    pre_sql:  "DELETE FROM [dbo].[S0_Cadence31] WHERE BatchId = '${batchId}'"
+    post_sql: "EXEC [dbo].[sp_AuditLog] '${batchId}', '${env}'"

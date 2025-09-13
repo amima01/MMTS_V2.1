@@ -1,0 +1,70 @@
+workflow: "S0_MMTS_ML"
+version:  "1.0"
+description: "S0 batch workflow"
+
+params:
+  envName:  "dev"
+  dbName:   "MMTS_DB"
+  connStr:  "Server=.;Database=MMTS_DB;Trusted_Connection=True;Encrypt=False"
+  hookNs:   "POC.Hooks"          # Program overrides to this anyway
+  impl:     "v1"
+  batchId:  "2025-09-13"
+  emitMode: "bulk_upsert"
+
+datasources:
+  default:
+    kind: "mssql"
+    conn: "Server=.;Database=MMTS_DB;Trusted_Connection=True;Encrypt=False"
+
+tables:
+  s0_out:
+    ds:   "default"
+    name: "[dbo].[S0_Cadence31]"
+
+hooks:
+  s0.fetch:
+    module: "POC.Hooks.S0.Fetch.v1.Module"
+    func:   "Run"
+    kind:   "rows"
+  s0.transform:
+    module: "POC.Hooks.S0.Transform.v1.Module"
+    func:   "Run"
+    kind:   "rows"
+
+steps:
+  - id: s0.fetch
+    uses: "s0.fetch"        # HookKey ? resolves via hooks map
+    args:
+      batchId: "${params.batchId}"
+    out:
+      rows: "step:s0.fetch.rows"
+
+  - id: s0.transform
+    uses:
+      module: "POC.Hooks.S0.Transform.v1.Module"  # DotNet form also OK
+      func:   "Run"
+    in:
+      rows: "step:s0.fetch.rows"
+    args:
+      impl:   "${params.impl}"
+    out:
+      rows: "step:s0.transform.rows"
+
+validations:
+  - id: v1
+    on:   "step:s0.fetch.rows"
+    rule: "nonempty"
+  - id: v2
+    on:   "step:s0.transform.rows"
+    rule: "schemaMatch(Symbol, Price, Ts, BatchId, PriceZ, Impl)"
+
+materialize:
+  - from:  "step:s0.transform.rows"
+    to:    "table:s0_out"
+    mode:  "${params.emitMode}"
+    key:   ["Symbol","BatchId"]
+    pre_sql:  "DELETE FROM [dbo].[S0_Cadence31] WHERE BatchId = '${params.batchId}'"
+    post_sql: "EXEC [dbo].[sp_AuditLog] '${params.batchId}', '${params.envName}'"
+
+schedule:
+  cron: "0 0/5 * * * ?"   # every 5 minutes

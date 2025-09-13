@@ -1,0 +1,100 @@
+﻿# Friendly S0 workflow (MMTS_ML)
+# Notes:
+# - Comments start with '#'.
+# - ${params.*} and env:VAR interpolate everywhere (datasources, tables, hooks, steps, materialize).
+# - You can override params at runtime via per-workflow runner: --set key=value
+# - Modes: append | replace | upsert | bulk_upsert
+# Run them (two modes)
+# dotnet fsi gen_mmts_ml_runners.fsx --in . --out runners --runner mmts_ml_runner_repl.fsx
+# dotnet fsi runners/MMTS_ML_S1_Runner.fsx --dryrun --set batchId=2025-09-11
+# dotnet fsi runners/MMTS_ML_S2_Runner.fsx --dryrun --set batchId=2025-09-11
+# add --emit when ready to write
+# dotnet fsi runners/MMTS_ML_S1_Runner.fsx --repl
+# dotnet fsi runners/MMTS_ML_S2_Runner.fsx --repl
+
+workflow: "MMTS_ML_S0"
+version: "1.1"
+description: "S0: minimal, friendly example (fetch → transform → emit) with validations and dryrun support"
+
+params:
+  # Environment wiring
+  envName: dev
+  dbName: 0_CADENCE
+  connStr: env:MMTS_SQL_CONN   # supply through env var or override with --set connStr=...
+
+  # Hooks namespace/version for hot-swap
+  hookNs: POC.Hooks
+  impl: v1
+
+  # Batch context (override at run time)
+  batchId: YYYY-MM-DD
+
+  # Optional knobs
+  emitMode: bulk_upsert         # append | replace | upsert | bulk_upsert
+
+# --- Data connections & targets ---
+datasources:
+  default:
+    kind: mssql
+    conn: ${params.connStr}
+
+tables:
+  s0_out:
+    ds: default
+    name: [${params.dbName}].dbo.S0_Out
+
+# --- Hook registry ---
+# Implement these methods in your codebase; they must be public static.
+# You can hot-swap by changing params.hookNs / params.impl.
+hooks:
+  s0.fetch:
+    module: ${params.hookNs}.S0.Fetch.${params.impl}
+    func: Run
+    kind: rows
+  s0.transform:
+    module: ${params.hookNs}.S0.Transform.${params.impl}
+    func: Run
+    kind: rows
+
+# --- Steps ---
+steps:
+  - id: fetch
+    uses: ${params.envName} == "dev" ? s0.fetch : s0.fetch   # kept simple; can branch if you add more hooks
+    out:
+      rows: rows
+
+  - id: transform
+    uses: s0.transform
+    in:
+      rows: step:fetch.rows
+    args:
+      batchId: ${params.batchId}
+    out:
+      rows: rows
+
+# --- Validations (fast, friendly checks) ---
+validations:
+  - id: nonempty-final
+    on: step:transform.rows
+    rule: nonempty
+
+  - id: schema-final
+    on: step:transform.rows
+    rule: schemaMatch(Id, Name, Amount, BatchId)
+
+  - id: range-amount
+    on: step:transform.rows
+    rule: range(Amount, 0, 100000000)
+
+  - id: uniq-id
+    on: step:transform.rows
+    rule: unique(Id)
+
+# --- Materialization (what to write, where, and how) ---
+materialize:
+  - from: step:transform.rows
+    to: table:s0_out
+    mode: ${params.emitMode}   # bulk_upsert by default
+    key: [Id]
+    pre_sql: "DELETE FROM [${params.dbName}].dbo.S0_Out WHERE BatchId='${params.batchId}'"
+    post_sql: "EXEC dbo.sp_Touch_S0 @BatchId='${params.batchId}'"
