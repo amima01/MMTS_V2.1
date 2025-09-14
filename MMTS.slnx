@@ -3,7 +3,7 @@
   <Folder Name="/Doc/chats/">
     <File Path="CHATS/chats_2025-09-12.txt" />
     <File Path="CHATS/chats_2025-09-13.txt" />
-    <File Path="chats_2025-09-14.txt" />
+    <File Path="CHATS/chats_2025-09-14.txt" />
   </Folder>
   <Folder Name="/Doc/yaml/">
     <File Path="YAML/S0_MMTS_ML_2025-09-13.txt" />
