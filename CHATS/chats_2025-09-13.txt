@@ -1878,50 +1878,1273 @@ module YamlDebug =
         dumpNode 0 doc.RootNode
 
 ///////////////////////////////////////////////////
+ok, all good, got the roots/nodes pretty-prints...thank you...now, 
+let wire scheduler to run the hook for fetch and transform...can you give code?
+///////////////////////////////////////////////////
+awesome — let’s make the scheduler actually run your S0 workflow (Fetch → Transform) on a cron, 
+by reading your YAML each tick.
+Below is a focused, drop-in wiring you can paste into Program.fs. It:
+reads DOC\S0_MMTS_ML.yaml
+extracts schedule.cron from YAML (falls back to an interval if missing)
+defines a non-overlapping scheduled job that runs the YAML (with logging + safe error handling)
+keeps your heartbeat
+///////////////////////////////////////////////////
+namespace POC
+module Program =
+    open System
+    open System.IO
+    open System.Threading
+    open System.Threading.Tasks
+    open POC.Log
+    open POC.Schedule
+    open MMTS.ML.Types
+
+    // -----------------------------
+    // Stubs for side-effects used by Exec
+    // -----------------------------
+    let private sqlExec : MMTS.ML.Exec.SqlExec =
+        fun sql -> Log.infof "[sqlExec] %s" sql
+
+    let private bulkEmit : MMTS.ML.Exec.BulkEmit =
+        fun args ->
+            let count = args.rows |> List.length
+            Log.infof "[bulkEmit] mode=%s table=%s rows=%d keys=%A conn=(%s)"
+                      args.mode args.table count args.key args.conn
+
+    // -----------------------------
+    // One-shot runner (reads YAML and executes it once)
+    // -----------------------------
+    let private runS0Once (yamlPath: string) : Task =
+        task {
+            try
+                let full = Path.GetFullPath yamlPath
+                if not (File.Exists full) then
+                    Log.errorf "YAML not found: %s" full
+                else
+                    let yaml = File.ReadAllText full
+                    // Parse + interpolate (apply a few convenient overrides)
+                    let spec0   = MMTS.ML.Parse.load yaml
+                    let p0      = spec0.parameters
+                    let p'      =
+                        { p0 with
+                            batchId = DateTime.Today.ToString("yyyy-MM-dd")
+                            hookNs  = if String.IsNullOrWhiteSpace p0.hookNs then "POC.Hooks" else p0.hookNs
+                            impl    = if String.IsNullOrWhiteSpace p0.impl   then "v1"        else p0.impl }
+                    let spec    = { spec0 with parameters = p' } |> MMTS.ML.Parse.interpolateAll
+
+                    // Build exec env, run, log summaries
+                    let env =
+                        { MMTS.ML.Exec.spec     = spec
+                          MMTS.ML.Exec.stepRows = System.Collections.Concurrent.ConcurrentDictionary<string, Rows>()
+                          MMTS.ML.Exec.sqlExec  = sqlExec
+                          MMTS.ML.Exec.bulkEmit = bulkEmit }
+
+                    MMTS.ML.Exec.run env
+
+                    // Summaries
+                    env.stepRows
+                    |> Seq.map (fun kv -> kv.Key, kv.Value.Length)
+                    |> Seq.sortBy fst
+                    |> Seq.iter (fun (k, n) -> Log.infof "[result] step=%s rows=%d" k n)
+
+            with ex ->
+                Log.errorf "S0 run failed: %s" ex.Message
+        }
+
+    // -----------------------------
+    // Create a ScheduledJob for S0 based on YAML's schedule.cron
+    // (falls back to every 5 minutes if missing)
+    // -----------------------------
+    let private makeS0Job (yamlPath: string) : ScheduledJob =
+        // read cron from YAML if present
+        let cronExpr =
+            try
+                let yaml = File.ReadAllText yamlPath
+                let spec = MMTS.ML.Parse.load yaml
+                match spec.schedule with
+                | Some s when not (String.IsNullOrWhiteSpace s.cron) -> s.cron
+                | _ -> "0 0/5 * * * ?" // default: every 5 minutes
+            with _ ->
+                "0 0/5 * * * ?"
+
+        // guard against overlapping executions
+        let running = ref 0
+
+        let action () = task {
+            if Interlocked.Exchange(running, 1) = 1 then
+                Log.warn "S0 job skipped; previous run still in progress."
+            else
+                try
+                    Log.infof "S0 scheduled run starting (cron=%s)" cronExpr
+                    do! runS0Once yamlPath
+                    Log.info "S0 scheduled run completed."
+                finally
+                    running := 0
+        }
+
+        { Id = "s0_workflow"
+          Schedule = Cron cronExpr
+          Action = action }
+
+    // -----------------------------
+    // Heartbeat job (unchanged)
+    // -----------------------------
+    let private heartbeatJob : ScheduledJob =
+        ScheduledJob.ofTask
+            "heartbeat"
+            (Interval (TimeSpan.FromSeconds 10.0))
+            (fun () -> task {
+                Log.infof "Heartbeat at %O" DateTime.Now
+                return ()
+            })
+
+    // -----------------------------
+    // Main
+    // -----------------------------
+    [<EntryPoint>]
+    let main argv =
+        Log.init("POC", "logs")
+
+        // resolve YAML path (allow override with --yaml "path")
+        let yamlPath =
+            let i = Array.FindIndex(argv, fun a -> a = "--yaml")
+            if i >= 0 && i + 1 < argv.Length then argv.[i+1]
+            else @"DOC\S0_MMTS_ML.yaml"
+        let fullYaml = Path.GetFullPath yamlPath
+        Log.infof "Using YAML: %s" fullYaml
+
+        // (optional) run once at startup
+        runS0Once fullYaml
+        |> Async.AwaitTask
+        |> Async.RunSynchronously
+
+        // start scheduler with S0 job + heartbeat
+        let jobs = [ makeS0Job fullYaml; heartbeatJob ]
+        Schedule.run jobs
+
+        Console.WriteLine("Scheduler started. Press ENTER to exit.")
+        Console.ReadLine() |> ignore
+
+        Log.close()
+        0
 
 ///////////////////////////////////////////////////
+What this does
+
+runS0Once: calls your loader/parser, interpolates params, executes the pipeline, 
+and logs row counts for each step (s0.fetch, s0.transform).
+
+makeS0Job: reads schedule.cron from the YAML (e.g., 0 0/5 * * * ?) and builds a Quartz job that:
+
+prevents overlaps using an atomic flag,
+
+logs start/finish, and
+
+runs runS0Once.
+
+Main:
+
+logs which YAML it’s using,
+
+runs once at startup (so you can see outputs immediately),
+
+then schedules periodic runs + your heartbeat.
+
+If you want misfire handling (e.g., “fire immediately if we missed a tick”), 
+we can change the TriggerBuilder to apply WithMisfireHandlingInstructionFireAndProceed() 
+inside your Schedule module. Happy to add that too.
+///////////////////////////////////////////////////
+got error....The type 'Task' does not match the type 'Task<unit>' on...Action = action...see below ....
+let action () = task { 
+    if Interlocked.Exchange(running, 1) = 1 then
+        Log.warn "S0 job skipped; previous run still in progress."
+    else
+        try
+            Log.infof "S0 scheduled run starting (cron=%s)" cronExpr
+            do! runS0Once yamlPath
+            Log.info "S0 scheduled run completed."
+        finally
+            running := 0
+}
+
+{ 
+    Id = "s0_workflow"
+    Schedule = Cron cronExpr
+    Action = action
+}
+///////////////////////////////////////////////////
+You’re right—your ScheduledJob.Action is typed as unit -> Task<unit>, 
+but task { ... } without an explicit return yields Task (non-generic). 
+Make the action return unit explicitly on all paths.
+
+Here’s the fixed snippet:
+///////////////////////////////////////////////////
+open System.Threading
+
+let private makeS0Job (yamlPath: string) : ScheduledJob =
+    let cronExpr =
+        try
+            let yaml = System.IO.File.ReadAllText yamlPath
+            let spec = MMTS.ML.Parse.load yaml
+            match spec.schedule with
+            | Some s when not (System.String.IsNullOrWhiteSpace s.cron) -> s.cron
+            | _ -> "0 0/5 * * * ?"
+        with _ -> "0 0/5 * * * ?"
+
+    let running = ref 0
+
+    // NOTE: return () on every path so the CE yields Task<unit>
+    let action () = task {
+        if Interlocked.Exchange(running, 1) = 1 then
+            Log.warn "S0 job skipped; previous run still in progress."
+            return ()   // <-- ensures Task<unit> in the fast-skip branch
+        else
+            try
+                Log.infof "S0 scheduled run starting (cron=%s)" cronExpr
+                do! runS0Once yamlPath
+                Log.info "S0 scheduled run completed."
+                return () // <-- explicit unit return for the main path
+            finally
+                running := 0
+    }
+
+    { Id = "s0_workflow"
+      Schedule = Cron cronExpr
+      Action = action }   // now has type unit -> Task<unit>
 
 ///////////////////////////////////////////////////
+If you prefer to keep actions as unit -> Task instead, 
+you can also change your ScheduledJob definition to:
+///////////////////////////////////////////////////
+type ScheduledJob =
+  { Id       : string
+    Schedule : ScheduleKind
+    Action   : unit -> System.Threading.Tasks.Task } // non-generic Task
 
 ///////////////////////////////////////////////////
+…but given your current signature expects Task<unit>, 
+the first fix (explicit return ()) is the cleanest.
+///////////////////////////////////////////////////
+but subtle detail here:
+
+task { ... } in F# always produces a Task<'T> where 'T is inferred from your last return/return!.
+
+If you don’t return () (unit), the compiler may infer Task (non-generic), 
+but then you’ve got an implicit mismatch with the rest of your pipeline 
+(your ScheduledJob.Action is typed unit -> Task, or unit -> Task<unit>, 
+depending on how you defined it).
+///////////////////////////////////////////////////
+let action () : Task = task {
+    if Interlocked.Exchange(running, 1) = 1 then
+        Log.warn "S0 job skipped; previous run still in progress."
+    else
+        try
+            Log.infof "S0 scheduled run starting (cron=%s)" cronExpr
+            do! runS0Once yamlPath
+            Log.info "S0 scheduled run completed."
+        finally
+            running := 0
+}
 
 ///////////////////////////////////////////////////
+Here the CE yields Task<unit>, which is upcast to Task because of the return type annotation.
+///////////////////////////////////////////////////
+let action () : Task<unit> = task {
+    if Interlocked.Exchange(running, 1) = 1 then
+        Log.warn "S0 job skipped; previous run still in progress."
+        return ()   // ensures Task<unit>
+    else
+        try
+            Log.infof "S0 scheduled run starting (cron=%s)" cronExpr
+            do! runS0Once yamlPath
+            Log.info "S0 scheduled run completed."
+            return () 
+        finally
+            running := 0
+}
 
 ///////////////////////////////////////////////////
+So it depends on how you typed Action in ScheduledJob.
+
+If it’s unit -> Task → your current fix is perfectly fine.
+
+If it’s unit -> Task<unit> → add explicit return ().
+
+Do you want me to recheck your latest Schedule.fs 
+definition of ScheduledJob so we’re 100% aligned?
+///////////////////////////////////////////////////
+here’s a tiny, drop-in pretty-printer for the Hooks registry 
+that you can call right after parsing/interpolation. 
+It prints neat columns (key, module, func, kind) 
+and checks whether the target type/method actually exists in loaded assemblies.
+
+1) Add this helper (e.g., Program.fs or a new Debug.fs)
+///////////////////////////////////////////////////
+module HooksDebug =
+    open System
+    open System.Reflection
+    open MMTS.ML.Types
+    open POC.Log
+
+    // resolve a type by full name across loaded assemblies
+    let private tryResolveType (fullName: string) =
+        match Type.GetType(fullName, throwOnError = false) with
+        | null ->
+            AppDomain.CurrentDomain.GetAssemblies()
+            |> Seq.tryPick (fun asm ->
+                let t = asm.GetType(fullName, throwOnError = false)
+                if isNull t then None else Some t)
+        | t -> Some t
+
+    /// Pretty-print the hooks table and validate type/method presence
+    let dumpHooks (spec: Spec) =
+        if spec.hooks.IsEmpty then
+            Log.warn "hooks: <empty>"
+        else
+            // build rows
+            let rows =
+                spec.hooks
+                |> Map.toList
+                |> List.map (fun (key, h) ->
+                    // status: TYPE? NOFUNC? OK
+                    let status =
+                        try
+                            match tryResolveType h.moduleName with
+                            | None      -> "TYPE?"
+                            | Some typ  ->
+                                let mi = typ.GetMethod(h.func, BindingFlags.Public ||| BindingFlags.Static)
+                                if isNull mi then "NOFUNC" else "OK"
+                        with _ -> "ERROR"
+                    (key, h.moduleName, h.func, h.kind, status))
+
+            // column widths
+            let wKey   = max 3 (rows |> List.maxBy (fun (k,_,_,_,_) -> k.Length) |> fun (k,_,_,_,_) -> k.Length)
+            let wMod   = max 6 (rows |> List.maxBy (fun (_,m,_,_,_) -> m.Length) |> fun (_,m,_,_,_) -> m.Length)
+            let wFunc  = max 4 (rows |> List.maxBy (fun (_,_,f,_,_) -> f.Length) |> fun (_,_,f,_,_) -> f.Length)
+            let wKind  = max 4 (rows |> List.maxBy (fun (_,_,_,k,_) -> k.Length) |> fun (_,_,_,k,_) -> k.Length)
+            let wStat  = 6
+
+            let header =
+                $"| {"key".PadRight wKey} | {"module".PadRight wMod} | {"func".PadRight wFunc} | {"kind".PadRight wKind} | {"status".PadRight wStat} |"
+
+            let sep =
+                "|-" + String('-', wKey) + "-|-" + String('-', wMod) + "-|-" + String('-', wFunc) +
+                "-|-" + String('-', wKind) + "-|-" + String('-', wStat) + "-|"
+
+            Log.info "hooks registry:"
+            Log.info header
+            Log.info sep
+            rows
+            |> List.iter (fun (k,m,f,kind,status) ->
+                Log.info (sprintf "| %s | %s | %s | %s | %s |"
+                              (k.PadRight wKey)
+                              (m.PadRight wMod)
+                              (f.PadRight wFunc)
+                              (kind.PadRight wKind)
+                              (status.PadRight wStat)))
 
 ///////////////////////////////////////////////////
+2) Call it right after you parse + interpolate
+
+Where you currently have:
+let spec0 = MMTS.ML.Parse.load yaml
+let spec  = { spec0 with parameters = p' } |> MMTS.ML.Parse.interpolateAll
+HooksDebug.dumpHooks spec
 
 ///////////////////////////////////////////////////
+F#’s interpolated string syntax is stricter than C#’s.
+You can’t directly nest { "string".PadRight n } inside the $"" — the parser gets confused.
+
+Two easy fixes:
+Fix 1: pre-bind each column name
+///////////////////////////////////////////////////
+let keyHdr   = "key".PadRight wKey
+let modHdr   = "module".PadRight wMod
+let funcHdr  = "func".PadRight wFunc
+let kindHdr  = "kind".PadRight wKind
+let statHdr  = "status".PadRight wStat
+
+let header =
+    $"| {keyHdr} | {modHdr} | {funcHdr} | {kindHdr} | {statHdr} |"
 
 ///////////////////////////////////////////////////
+Fix 2: don’t interpolate string literals, just concat
+...
+let header =
+    "| " + "key".PadRight wKey +
+    " | " + "module".PadRight wMod +
+    " | " + "func".PadRight wFunc +
+    " | " + "kind".PadRight wKind +
+    " | " + "status".PadRight wStat + " |"
 
 ///////////////////////////////////////////////////
+glad the hooks registry dump looks sharp.
+let’s now pretty-print the step results (env.stepRows) 
+after execution so you can see what fetch/transform produced.
+1) add a helper module
+///////////////////////////////////////////////////
+module ResultsDebug =
+    open System
+    open MMTS.ML.Types
+    open POC.Log
+
+    /// Pretty-print a set of step results (env.stepRows)
+    let dumpResults (stepRows: System.Collections.Concurrent.ConcurrentDictionary<string, Rows>) =
+        if stepRows.IsEmpty then
+            Log.warn "results: <empty>"
+        else
+            Log.info "results summary:"
+            for kv in stepRows |> Seq.sortBy (fun kv -> kv.Key) do
+                let key  = kv.Key
+                let rows = kv.Value
+                Log.infof "step=%s rows=%d" key rows.Length
+
+                if not rows.IsEmpty then
+                    // take a sample row
+                    let sample = rows |> List.head
+                    let cols   = sample |> Map.toList |> List.map fst
+
+                    // header
+                    let header = String.Join(" | ", cols)
+                    Log.infof "  cols: %s" header
+
+                    // first few rows
+                    rows
+                    |> Seq.truncate 5
+                    |> Seq.iter (fun r ->
+                        let vals =
+                            cols
+                            |> List.map (fun c ->
+                                match r.TryFind c with
+                                | Some v -> string v
+                                | None -> "")
+                        Log.infof "  data: %s" (String.Join(" | ", vals)) )
+
+                    if rows.Length > 5 then
+                        Log.infof "  ... (%d more rows)" (rows.Length - 5)
 
 ///////////////////////////////////////////////////
+2) call it after execution
+
+in your runS0Once (after Exec.run env), add:
+ResultsDebug.dumpResults env.stepRows
+///////////////////////////////////////////////////
+here’s a drop-in POC.Hooks.S0.Fetch.v1.Module that:
+
+ensures the DB objects exist (creates dbo.S0_Cadence31 table if missing, installs TVP + MERGE proc + index),
+
+fetches OHLC bars via your existing reader using your Example column maps, and
+
+returns them as Rows (list of maps) for the MMTS pipeline to consume.
+
+I’ve used your uploaded modules so it fits your environment (reader/robust/writer/sql-setup)
+POC/Hooks/S0/Fetch/v1.fs
+///////////////////////////////////////////////////
+namespace POC.Hooks.S0.Fetch.v1
+
+open System
+open System.Data
+open System.Text
+open Microsoft.Data.SqlClient
+
+open MMTS.ML.Types                  // Rows = list< Map<string,obj> >
+open MMTS.S0                        // DataFeed, DataField, ColumnMap, DbConfig, etc.
+open MMTS.S0.reader                 // readOhlc
+open MMTS.S0.S0Writer               // (not used here, but handy if you later want to upsert raw)
+open MMTS.S0.S0_SqlSetup            // .sql text for TVP/proc/index install (your file)
+open MMTS.S0.Robust                 // writeCadence31 (not used here)
+open MMTS.S0                        // Examples.dbCfg lives in your uploaded Program.txt
+
+module private DbInit =
+
+    /// Split a T-SQL script on GO batch separators (line with only 'GO', case-insensitive).
+    let private splitOnGo (sql:string) =
+        let lines = sql.Replace("\r\n","\n").Split('\n')
+        let batches = System.Collections.Generic.List<string>()
+        let sb = StringBuilder()
+        let flush () =
+            if sb.Length > 0 then
+                batches.Add(sb.ToString().TrimEnd())
+                sb.Clear() |> ignore
+        for line in lines do
+            if line.Trim().Equals("GO", StringComparison.OrdinalIgnoreCase) then
+                flush()
+            else
+                sb.AppendLine(line) |> ignore
+        flush()
+        batches |> Seq.toList |> List.filter (fun b -> b.Trim() <> "")
+
+    /// Execute a SQL statement (no results).
+    let private execNonQuery (connStr:string) (sql:string) =
+        use conn = new SqlConnection(connStr)
+        use cmd  = new SqlCommand(sql, conn)
+        cmd.CommandType <- CommandType.Text
+        conn.Open()
+        cmd.ExecuteNonQuery() |> ignore
+
+    /// Create the S0_Cadence31 table if it doesn't exist (columns match your TVP & proc).
+    let ensureCadence31Table (connStr:string) =
+        let ddl = """
+IF OBJECT_ID(N'dbo.S0_Cadence31', N'U') IS NULL
+BEGIN
+  CREATE TABLE dbo.S0_Cadence31
+  (
+    DataFeed   VARCHAR(32)  NOT NULL,
+    Symbol     VARCHAR(32)  NOT NULL,
+    StatName   VARCHAR(64)  NOT NULL,
+    DataField  VARCHAR(64)  NULL,
+    TradeDate  DATE         NOT NULL,
+    Dt         DATETIME2(0) NOT NULL,
+    Raw        FLOAT(53)    NULL,
+    Med        FLOAT(53)    NULL,
+    Mad        FLOAT(53)    NULL,
+    Scale      FLOAT(53)    NULL,
+    MZ         FLOAT(53)    NULL,
+    Weight     FLOAT(53)    NULL,
+    Clean      FLOAT(53)    NULL,
+    Cadence    FLOAT(53)    NULL,
+    Source     VARCHAR(64)  NULL
+  );
+END
+"""
+        execNonQuery connStr ddl
+
+    /// Install / refresh the TVP type + MERGE proc + index using your script (handles GO).
+    let ensureTvpAndProc (connStr:string) =
+        let batches = splitOnGo S0_SqlSetup.sql
+        for b in batches do
+            execNonQuery connStr b
+
+    /// One-shot idempotent install (safe to call every run)
+    let ensureAll (connStr:string) =
+        ensureCadence31Table connStr
+        ensureTvpAndProc connStr
+
+
+module private ParseArg =
+    let get (k:string) (d:string) (m:Map<string,string>) =
+        m |> Map.tryFind k |> Option.defaultValue d
+
+    let getDate (k:string) (d:DateTime) (m:Map<string,string>) =
+        match m |> Map.tryFind k with
+        | None -> d
+        | Some s ->
+            match DateTime.TryParse s with
+            | true, dt -> dt
+            | _ -> d
+
+    let tryFeed (s:string) =
+        match s.Trim().ToUpperInvariant() with
+        | "EOD1DAY_YAHOO" -> Some DataFeed.EOD1Day_YAHOO
+        | "EOD1DAY_IBRK"  -> Some DataFeed.EOD1Day_IBRK
+        | "EOD5SECS"      -> Some DataFeed.EOD5Secs
+        | _ -> None
+
+    /// Accept comma-separated list of feeds; default to EOD1Day_YAHOO
+    let feeds (m:Map<string,string>) =
+        match m |> Map.tryFind "feeds" with
+        | None -> [ DataFeed.EOD1Day_YAHOO ]
+        | Some csv ->
+            csv.Split([|','|], StringSplitOptions.RemoveEmptyEntries)
+            |> Array.choose (fun s -> tryFeed s)
+            |> Array.toList
+            |> function
+               | [] -> [ DataFeed.EOD1Day_YAHOO ]
+               | xs -> xs
+
+open ParseArg
+open DbInit
+
+type Module =
+    /// Run signature (no input rows): returns Rows for the next step.
+    /// Args expected (defaults in parens):
+    /// - connStr: SQL connection string (required in real runs)
+    /// - symbol : ("AAPL")
+    /// - t0     : from date ("2024-01-01")
+    /// - t1     : to date   ("2024-12-31")
+    /// - feeds  : CSV list of feeds ("EOD1Day_YAHOO,EOD1Day_IBRK")
+    static member Run(args: Map<string,string>) : Rows =
+        // 1) Connection string (try args, then a dev default)
+        let connStr =
+            match args |> Map.tryFind "connStr" with
+            | Some s when not (String.IsNullOrWhiteSpace s) -> s
+            | _ -> "Server=.;Database=0_1Day_V01;Trusted_Connection=True;Encrypt=False"
+
+        // 2) Ensure DB objects (table, TVP type, MERGE proc, index)
+        ensureAll connStr  // uses your S0_SqlSetup.sql to install TVP/proc/index
+
+        // 3) Pull request parameters
+        let symbol = get "symbol" "AAPL" args
+        let t0     = getDate "t0" (DateTime(2024,1,1)) args
+        let t1     = getDate "t1" (DateTime(2024,12,31)) args
+        let feedsL = feeds args
+
+        // 4) Use your Example mappings for EOD1Day/EOD5Secs
+        //    (from your Program.txt: Examples.dbCfg)
+        let dbCfg =
+            // MMTS.S0.Examples.dbCfg was included with your upload; reference it here.
+            // If you later move it, inject via params instead.
+            MMTS.S0.Examples.dbCfg
+
+        // 5) Read bars for each feed, accumulate into Rows
+        let mutable out : Rows = []
+
+        for feed in feedsL do
+            let bars = reader.readOhlc connStr dbCfg feed symbol t0 t1
+            // Map each OHLC row into a generic Row (Map<string,obj>) for MMTS
+            let feedName = feed.ToString()
+            let rows =
+                bars
+                |> List.map (fun b ->
+                    Map [
+                        "DataFeed",  box feedName
+                        "Symbol",    box symbol
+                        "T",         box b.T
+                        "O",         box b.O
+                        "H",         box b.H
+                        "L",         box b.L
+                        "C",         box b.C
+                        "V",         box b.V
+                        "Count",     box b.Count
+                        "Wap",       box b.Wap
+                    ])
+            out <- out @ rows
+
+        // 6) Return combined Rows to the pipeline (e.g., for S0.Transform)
+        out
 
 ///////////////////////////////////////////////////
+How to call it from YAML
+
+You already have this in your YAML (good):
+///////////////////////////////////////////////////
+hooks:
+  s0.fetch:
+    module: "POC.Hooks.S0.Fetch.v1.Module"
+    func:   "Run"
+    kind:   "rows"
+
+steps:
+  - id: s0.fetch
+    uses: "s0.fetch"
+    args:
+      connStr: "${params.connStr}"
+      symbol:  "AAPL"
+      t0:      "2024-01-01"
+      t1:      "2024-12-31"
+      feeds:   "EOD1Day_YAHOO,EOD1Day_IBRK"
+    out:
+      rows: "step:s0.fetch.rows"
 
 ///////////////////////////////////////////////////
+Short answer: schemaMatch checks the columns in the in-memory Rows coming from a step, 
+not the DB table. So your rule must match the shape your s0.transform actually emits.
+
+Right now your rule expects:
+schemaMatch(Symbol, Price, Ts, BatchId, PriceZ, Impl)
+…but your S0 path (Cadence-31) uses the CadRow/TVP shape that looks like:
+DataFeed, Symbol, StatName, DataField, TradeDate, Dt, Raw, Med, Mad, Scale, MZ, Weight, Clean, Cadence, Source
+
+(that’s how the writer/TVP/proc and records are defined).
+
+What to do
+
+If s0.transform still outputs your earlier “analytics” row (Price, PriceZ, …), keep your current rule.
+
+If s0.transform now produces Cadence-31 rows to materialize into dbo.S0_Cadence31, change the rule to match that schema, e.g.:
+....
+validations:
+  - id: v1
+    on:   "step:s0.fetch.rows"
+    rule: "nonempty"
+
+  # validate the exact shape you're about to materialize
+  - id: v2
+    on:   "step:s0.transform.rows"
+    rule: "schemaMatch(DataFeed, Symbol, StatName, DataField, TradeDate, Dt, Raw, Med, Mad, Scale, MZ, Weight, Clean, Cadence, Source)"
+
+S0 run failed: Validation failed: v2: schema mismatch; need ...
+[DataFeed,Symbol,StatName,DataField,TradeDate,Dt,Raw,Med,Mad,Scale,MZ,Weight,Clean,Cadence,Source]
 
 ///////////////////////////////////////////////////
+  - id: v3
+    on: "step:s0.transform.rows"
+    rule: "unique(Dt)"
+(Or a stronger uniqueness over a concatenated key you emit, e.g., Symbol+Dt if your transform outputs that.)
+///////////////////////////////////////////////////
+1) Log the exact columns your step produced (diff vs expected)
+
+Drop this helper somewhere (e.g., ResultsDebug.fs) and 
+call it in your catch block when the validation fails:
+///////////////////////////////////////////////////
+module ResultsDebug =
+    open System
+    open MMTS.ML.Types
+    open POC.Log
+
+    let private colsOf (rows: Rows) =
+        match rows with
+        | [] -> Set.empty
+        | r::_ -> r |> Map.toList |> List.map fst |> Set.ofList
+
+    let dumpSchemaDiff (stepId: string) (rows: Rows) (expected: string list) =
+        let exp = Set.ofList expected
+        let got = colsOf rows
+        Log.infof "schema for step=%s" stepId
+        Log.infof "  expected: %s" (String.Join(", ", expected))
+        Log.infof "  got     : %s" (String.Join(", ", got |> Set.toList))
+        let missing = exp - got
+        let extra   = got - exp
+        if not (Set.isEmpty missing) then Log.errorf "  MISSING: %s" (String.Join(", ", missing))
+        if not (Set.isEmpty extra)   then Log.warnf  "  EXTRA  : %s" (String.Join(", ", extra))
 
 ///////////////////////////////////////////////////
+Then, in your runS0Once catch:
+....
+with ex ->
+    if ex.Message.StartsWith("Validation failed") then
+        // try to dump the transform step’s schema
+        let expected = [
+          "DataFeed"; "Symbol"; "StatName"; "DataField"; "TradeDate"; "Dt";
+          "Raw"; "Med"; "Mad"; "Scale"; "MZ"; "Weight"; "Clean"; "Cadence"; "Source"
+        ]
+        match env.stepRows.TryGetValue "s0.transform" with
+        | true, r -> ResultsDebug.dumpSchemaDiff "s0.transform" r expected
+        | _ -> Log.error "no rows stored for step 's0.transform'"
+    Log.errorf "S0 run failed: %s" ex.Message
+///////////////////////////////////////////////////
+This will print “MISSING/EXTRA” keys so you know exactly what to rename or add.
+2) Make sure your transform really emits the Cadence-31 columns
+
+Your Cadence-31 record and writer are defined with those exact names (case-sensitive): DataFeed, Symbol, StatName, DataField, TradeDate, Dt, Raw, Med, Mad, Scale, MZ, Weight, Clean, Cadence, Source.
+
+Also your SQL TVP/proc expects the same names.
+
+If your transform builds CadRow list, convert each to a Row like this:
+///////////////////////////////////////////////////
+let private cadRowToRow (r: MMTS.S0.Robust.CadRow) : MMTS.ML.Types.Row =
+    Map [
+      "DataFeed",  box r.DataFeed
+      "Symbol",    box r.Symbol
+      "StatName",  box r.StatName
+      "DataField", box r.DataField
+      "TradeDate", box r.TradeDate
+      "Dt",        box r.Dt
+      "Raw",       box r.Raw
+      "Med",       box r.Med
+      "Mad",       box r.Mad
+      "Scale",     box r.Scale
+      "MZ",        box r.MZ
+      "Weight",    box r.Weight
+      "Clean",     box r.Clean
+      "Cadence",   box r.Cadence
+      "Source",    box r.Source
+    ]
 
 ///////////////////////////////////////////////////
+…and return a Rows:
+
+let rows : Rows = cadRows |> List.map cadRowToRow
+rows
+
 
 ///////////////////////////////////////////////////
+3) If you really want to validate against your intermediate analytics shape
+
+If your current s0.transform is still emitting analytics columns 
+like Price, Ts, PriceZ, Impl, change your YAML back to that schema:
+...- id: v2
+  on:   "step:s0.transform.rows"
+  rule: "schemaMatch(Symbol, Price, Ts, BatchId, PriceZ, Impl)"
+
+  ...
+  …but if you’re moving towards Cadence-31 and S0_Cadence31 upsert, 
+  keep the Cadence schema and make the transform return those columns.
+///////////////////////////////////////////////////
+4) Sanity: how your upstream data flows
+
+reader.readOhlc selects T,O,H,L,C,V,Count,Wap and returns Ohlc records; names are exactly those (note T and Count, Wap).
+
+You convert to change-triples and/or to CadRow (Cadence-31) with fields listed above.
+
+The TVP/proc use the same column names as CadRow.
+
+So the correct validation for what you’re about to materialize into S0_Cadence31 is the Cadence-31 schema. 
+Once your transform returns those keys, schemaMatch will pass.
+///////////////////////////////////////////////////
+Absolutely—here’s a ready-to-drop-in POC.Hooks.S0.Transform.v1 that takes the OHLC rows from your s0.fetch, 
+computes Cadence-31 for both the raw OHLC series and the chg_* series, 
+and returns the canonical S0_Cadence31 row shape your validation/materialize expect.
+
+It leans directly on your uploaded modules for OHLC reading/shape, change-series, and Cadence-31 logic.
+///////////////////////////////////////////////////
+namespace POC.Hooks.S0.Transform.v1
+
+open System
+open MMTS.ML.Types
+
+open MMTS.S0
+open MMTS.S0.OhlcChg           // buildChangeTriples, toOhlcChgWithCountAndWap
+open MMTS.S0.RobustCadence31   // cadence31 (OHLC), plus types for Cadence31-chg helpers
+open MMTS.S0.Cadence31ChgWriter
+open MMTS.S0.reader            // just for types; we don't hit the DB here
+
+[<AutoOpen>]
+module private Util =
+    let tryAs<'T> (k:string) (m:Row) =
+        match Map.tryFind k m with
+        | Some v ->
+            try Some (v :?> 'T) with _ -> None
+        | None -> None
+
+    let getStr k (m:Row) = tryAs<string> k m |> Option.defaultValue ""
+    let getF   k (m:Row) =
+        match Map.tryFind k m with
+        | Some (:? float as f) -> f
+        | Some v ->
+            match v with
+            | :? int    as i -> float i
+            | :? int64  as i -> float i
+            | :? double as d -> d
+            | :? single as s -> float s
+            | :? decimal as d -> float d
+            | _ -> Double.NaN
+        | None -> Double.NaN
+
+    let getDt k (m:Row) =
+        match Map.tryFind k m with
+        | Some (:? DateTime as t) -> t
+        | Some v ->
+            match v with
+            | :? string as s ->
+                let ok, dt = DateTime.TryParse s
+                if ok then dt else DateTime.MinValue
+            | _ -> DateTime.MinValue
+        | None -> DateTime.MinValue
+
+    /// Convert our robust CadRow record into pipeline Row (Map<string,obj>)
+    let cadRowToRow (r: MMTS.S0.Robust.CadRow) : Row =
+        Map [
+          "DataFeed",  box r.DataFeed
+          "Symbol",    box r.Symbol
+          "StatName",  box r.StatName
+          "DataField", box r.DataField
+          "TradeDate", box r.TradeDate
+          "Dt",        box r.Dt
+          "Raw",       box r.Raw
+          "Med",       box r.Med
+          "Mad",       box r.Mad
+          "Scale",     box r.Scale
+          "MZ",        box r.MZ
+          "Weight",    box r.Weight
+          "Clean",     box r.Clean
+          "Cadence",   box r.Cadence
+          "Source",    box r.Source
+        ]
+
+    /// Build (Dt,value) series for a specific OHLC field
+    let buildSeries (fieldName:string) (rows: Row list) : (DateTime * float) list =
+        rows
+        |> List.map (fun r ->
+            let ts = getDt   "T" r
+            let v  =
+                match fieldName with
+                | "OP"   -> getF "O" r
+                | "HI"   -> getF "H" r
+                | "LO"   -> getF "L" r
+                | "CL"   -> getF "C" r
+                | "VO"   -> getF "V" r
+                | "WAP"  ->
+                    let w = getF "Wap" r
+                    if Double.IsNaN w then
+                        // fallback: simple average if wap missing
+                        let o = getF "O" r
+                        let h = getF "H" r
+                        let l = getF "L" r
+                        let c = getF "C" r
+                        (o + h + l + c) / 4.0
+                    else w
+                | "COUNT" -> getF "Count" r
+                | _       -> Double.NaN
+            ts, v)
+        |> List.sortBy fst
+
+    /// Derive Ohlc_chg list (with optional Count/Wap support) from input Rows
+    let toOhlcChgList (rows: Row list) : OhlcChg.Ohlc_chg list =
+        rows
+        |> OhlcChg.toOhlcChgWithCountAndWap
+               (fun r -> getDt "T" r)
+               (fun r -> getF  "O" r)
+               (fun r -> getF  "H" r)
+               (fun r -> getF  "L" r)
+               (fun r -> getF  "C" r)
+               (fun r -> getF  "V" r)
+               (fun r ->          // Count (optional)
+                    let x = getF "Count" r
+                    if Double.IsNaN x then None else Some x)
+               (fun r ->          // Wap (optional)
+                    let x = getF "Wap" r
+                    if Double.IsNaN x then None else Some x)
+
+    /// Project a group (feed,symbol) + one named series into CadRow list using cadence31
+    let seriesToCadRows
+        (feed:string)
+        (symbol:string)
+        (statName:string)
+        (dataField:string)
+        (source:string)
+        (series: (DateTime*float) list)
+        : MMTS.S0.Robust.CadRow list =
+        RobustCadence31.cadence31 series
+        |> List.map (fun (dt, raw, med, mad, scale, mz, w, clean, cad) ->
+            { DataFeed  = feed
+              Symbol    = symbol
+              StatName  = statName
+              DataField = dataField
+              TradeDate = dt.Date
+              Dt        = dt
+              Raw       = raw
+              Med       = med
+              Mad       = mad
+              Scale     = scale
+              MZ        = mz
+              Weight    = w
+              Clean     = clean
+              Cadence   = cad
+              Source    = source })
+
+type Module =
+    /// Transform: takes OHLC rows from fetch and emits Cadence-31 rows (OHLC + chg_*).
+    /// Args:
+    ///   - mode: "both" (default) | "ohlc" | "chg"
+    ///   - keep: optional CSV list of chg_* names to include (e.g., "chg_WAP,chg_CL")
+    ///   - dataFieldOHLC: override DataField for OHLC rows (default "OHLC")
+    ///   - dataFieldCHG : override DataField for chg rows  (default "OHLC_CHG")
+    static member Run(rows: Rows, args: Map<string,string>) : Rows =
+        // group by (DataFeed, Symbol) so mixed feeds/symbols work
+        let groups =
+            rows
+            |> List.groupBy (fun r -> getStr "DataFeed" r, getStr "Symbol" r)
+
+        let mode =
+            args |> Map.tryFind "mode"
+                 |> Option.defaultValue "both"
+                 |> fun s -> s.Trim().ToLowerInvariant()
+
+        let keepNamesOpt =
+            args |> Map.tryFind "keep"
+                 |> Option.map (fun csv ->
+                        csv.Split([|','|], StringSplitOptions.RemoveEmptyEntries)
+                        |> Array.map (fun s -> s.Trim())
+                        |> Array.toList)
+
+        let dfOHLC = args |> Map.tryFind "dataFieldOHLC" |> Option.defaultValue "OHLC"
+        let dfCHG  = args |> Map.tryFind "dataFieldCHG"  |> Option.defaultValue "OHLC_CHG"
+
+        let mutable outCadRows : MMTS.S0.Robust.CadRow list = []
+
+        for ((feed,symbol), rowsOne) in groups do
+            let sourceTag = if String.IsNullOrWhiteSpace feed then "UNKNOWN" else feed
+
+            // ---- A) OHLC Cadence-31 ----
+            if mode = "both" || mode = "ohlc" then
+                // build series for OP/HI/LO/CL/VO/WAP (+COUNT if present)
+                let series =
+                    [ "OP"; "HI"; "LO"; "CL"; "VO"; "WAP" ]
+                    |> List.map (fun name -> name, buildSeries name rowsOne)
+                    |> List.filter (fun (_, s) -> not s.IsEmpty)
+
+                // include COUNT only if present (any non-NaN)
+                let hasCount =
+                    rowsOne |> List.exists (fun r -> not (Double.IsNaN (getF "Count" r)))
+                let series =
+                    if hasCount then series @ [ "COUNT", buildSeries "COUNT" rowsOne ]
+                    else series
+
+                for (statName, s) in series do
+                    let cad = Util.seriesToCadRows feed symbol statName dfOHLC sourceTag s
+                    outCadRows <- outCadRows @ cad
+
+            // ---- B) chg_* Cadence-31 ----
+            if mode = "both" || mode = "chg" then
+                let ohlcChg = toOhlcChgList rowsOne
+                let triples = OhlcChg.buildChangeTriples ohlcChg
+                let cadChgRows =
+                    Cadence31ChgWriter.cadence31_chg_toCadRows
+                        triples feed symbol dfCHG sourceTag keepNamesOpt
+                outCadRows <- outCadRows @ cadChgRows
+
+        // Convert to pipeline Rows and return
+        outCadRows |> List.map cadRowToRow
+
+    /// Overload: if the engine accidentally calls transform without input rows, be graceful.
+    static member Run(args: Map<string,string>) : Rows =
+        // No input rows ⇒ nothing to transform.
+        []
 
 ///////////////////////////////////////////////////
+Notes
+
+Input shape expected from fetch: each row carries DataFeed, Symbol, T, O, H, L, C, V, Count?, Wap?. That’s exactly what your fetch returns; we read those keys, build series, and compute Cadence-31.
+
+OHLC cadence uses your RobustCadence31.cadence31 with canonical output mapped into CadRow (DataFeed, Symbol, StatName, DataField="OHLC", TradeDate, Dt, Raw, Med, Mad, Scale, MZ, Weight, Clean, Cadence, Source).
+
+chg cadence builds chg_* triples via OhlcChg.buildChangeTriples and turns them into CadRow via Cadence31ChgWriter.cadence31_chg_toCadRows. You can filter with keep: "chg_WAP,chg_CL,...".
+
+Output schema exactly matches your TVP/proc & your schemaMatch rule for s0.transform.rows.
+///////////////////////////////////////////////////
+YAML reminder (your current config already fits)
+...
+- id: s0.transform
+  uses:
+    module: "POC.Hooks.S0.Transform.v1.Module"
+    func:   "Run"
+  in:
+    rows: "step:s0.fetch.rows"
+  args:
+    mode: "both"                    # both | ohlc | chg
+    keep: "chg_WAP,chg_CL"          # optional filter for chg_*
+    dataFieldOHLC: "OHLC"
+    dataFieldCHG:  "OHLC_CHG"
+  out:
+    rows: "step:s0.transform.rows"
+
+validations:
+  - id: v2
+    on:   "step:s0.transform.rows"
+    rule: "schemaMatch(DataFeed, Symbol, StatName, DataField, TradeDate, Dt, Raw, Med, Mad, Scale, MZ, Weight, Clean, Cadence, Source)"
+
 
 ///////////////////////////////////////////////////
+YAML reminder (your current config already fits)
+...
+- id: s0.transform
+  uses:
+    module: "POC.Hooks.S0.Transform.v1.Module"
+    func:   "Run"
+  in:
+    rows: "step:s0.fetch.rows"
+  args:
+    mode: "both"                    # both | ohlc | chg
+    keep: "chg_WAP,chg_CL"          # optional filter for chg_*
+    dataFieldOHLC: "OHLC"
+    dataFieldCHG:  "OHLC_CHG"
+  out:
+    rows: "step:s0.transform.rows"
+
+validations:
+  - id: v2
+    on:   "step:s0.transform.rows"
+    rule: "schemaMatch(DataFeed, Symbol, StatName, DataField, TradeDate, Dt, Raw, Med, Mad, Scale, MZ, Weight, Clean, Cadence, Source)"
 
 ///////////////////////////////////////////////////
+I’ll wire a POC.Hooks.S0.Transform.v1.Module implementation so your YAML can actually run the s0.transform step and produce Cadence-31 shaped rows that will pass your schemaMatch.
+
+We already have:
+
+reader.readOhlc to fetch OHLC bars
+
+OhlcChg.buildChangeTriples etc.
+
+Robust.CadRow and Robust.writeCadence31
+
+So the transform hook’s job is to:
+
+Accept the fetch rows (from s0.fetch).
+
+Convert them into CadRow list (with all required columns).
+
+Return them as Rows (Map<string,obj> list).
+
+Here’s a scaffold:
+///////////////////////////////////////////////////
+namespace POC.Hooks.S0.Transform.v1
+
+open System
+open MMTS.ML.Types
+open MMTS.S0
+open MMTS.S0.OhlcChg
+open MMTS.S0.reader
+open MMTS.S0.Robust
+
+module Module =
+
+    /// Convert CadRow -> Row (Map<string,obj>) for schemaMatch & materialize
+    let private cadRowToRow (r: CadRow) : Row =
+        Map [
+            "DataFeed",  box r.DataFeed
+            "Symbol",    box r.Symbol
+            "StatName",  box r.StatName
+            "DataField", box r.DataField
+            "TradeDate", box r.TradeDate
+            "Dt",        box r.Dt
+            "Raw",       box r.Raw
+            "Med",       box r.Med
+            "Mad",       box r.Mad
+            "Scale",     box r.Scale
+            "MZ",        box r.MZ
+            "Weight",    box r.Weight
+            "Clean",     box r.Clean
+            "Cadence",   box r.Cadence
+            "Source",    box r.Source
+        ]
+
+    /// Example transform: run cadence-31 over CL (closing price) series
+    let Run (_rows: Rows) (args: Map<string,string>) : Rows =
+        let connStr = args.["connStr"]
+        let symbol  = args.["symbol"]
+        let fromDt  = DateTime.Parse(args.["from"])
+        let toDt    = DateTime.Parse(args.["to"])
+        let feed    = DataFeed.EOD1Day_IBRK   // hardcoded for now, parametrize later
+        let cfg     = Program.Examples.dbCfg
+
+        // read bars
+        let bars = reader.readOhlc connStr cfg feed symbol fromDt toDt
+        if bars.IsEmpty then [] else
+
+        // build close series
+        let closeSeries = bars |> List.map (fun b -> b.T, b.C) |> List.sortBy fst
+
+        // cadence-31
+        let enriched = RobustCadence31.cadence31 closeSeries
+
+        // map to CadRow
+        let cadRows =
+            enriched
+            |> List.map (fun (dt, raw, med, mad, scale, mz, w, clean, cad) ->
+                { DataFeed = feed.ToString()
+                  Symbol   = symbol
+                  StatName = "CL"
+                  DataField= "OHLC"
+                  TradeDate= dt.Date
+                  Dt       = dt
+                  Raw      = raw
+                  Med      = med
+                  Mad      = mad
+                  Scale    = scale
+                  MZ       = mz
+                  Weight   = w
+                  Clean    = clean
+                  Cadence  = cad
+                  Source   = feed.ToString() })
+
+        // convert to Rows
+        cadRows |> List.map cadRowToRow
 
 ///////////////////////////////////////////////////
+How it fits:
 
+The YAML passes ${params.connStr}, ${params.batchId}, etc.
+
+You can extend the args in YAML (symbol, from, to) to control the transform.
+
+The Rows it returns now have exactly the dbo.S0_Cadence31 schema (so schemaMatch passes).
+
+Your materialize rule will then upsert into S0_Cadence31.
 ///////////////////////////////////////////////////
+Question: do you want this transform to always write via 
+Robust.writeCadence31 inside the hook (side-effect), or only to return rows for Exec → materialize?
 
+Right now I gave you the second style (return rows only) so the REPL pipeline controls DB I/O.
 ///////////////////////////////////////////////////
+short answer: yes—the YAML-driven MMTS (hooks + schedule + logging) is a big step up in flexibility, repeatability, and team velocity. here’s a crisp compare to your old, code-wired approach.
 
+what you gain
+
+Decoupling & composability
+Fetch/transform/materialize are swappable “hooks”. Pipelines are just data (YAML). New flows = editing YAML, not shipping new binaries.
+
+Reproducibility
+A pipeline run is fully described by {YAML + params + code version}. You can re-run any batchId exactly.
+
+Environment portability
+One spec, many envs: ${params.connStr}, ${params.envName}, ${params.batchId} make promotion (dev→test→prod) easy.
+
+Operability
+
+Scheduler: run via cron or interval without changing code.
+
+Non-overlap guard: no double-firing.
+
+Logging: consistent Serilog logs (console + rolling files), debug dumps (hooks table, result schemas).
+
+Observability & Validation
+validations: (e.g., nonempty, schemaMatch, unique) fail fast before writes; much safer than “hope and merge”.
+
+REPL & dry-runs
+You can run a YAML once (ad-hoc), inspect rows, then schedule it. Great for exploratory work and incident response.
+
+Governance & reviews
+YAML is tiny, diff-able, and code-review friendly. Hook code remains small and unit-testable.
+
+tradeoffs (and how to handle them)
+
+YAML is untyped → schema drift & typos
+
+Mitigation: add a JSON-schema or custom parser checks (you already did expectScalar, pretty-print tree, dumpHooks, dumpResults, dumpSchemaDiff).
+
+Add CI: validate YAML on PR; run a “dry” parse + schemaMatch against golden samples.
+
+Parser/engine complexity
+
+Keep Parse small and boring, push logic into hooks.
+
+Version the spec (you already store version: "1.0"). If you evolve syntax, keep 1.x backward-compatible or provide a migrator.
+
+Debugging data shape
+
+You already have ResultsDebug.dumpResults and dumpSchemaDiff. Keep them on by default in dev.
+
+Performance under concurrency
+
+You’ve added foreach + group parallelism. Keep bounded DOP where sources are DB-bound; for CPU-heavy transforms, allow higher DOP.
+
+Materialize with TVP + MERGE is already idempotent and efficient—good.
+
+when it shines
+
+Multiple symbols/feeds, many small variants of the same flow.
+
+Rapid iteration on transforms without destabilizing the worker.
+
+On-call operations: tweak cron / parameters in YAML, re-run a batch with a different batchId quickly.
+
+Audits: show the exact YAML + code SHA that produced a table state.
+
+when to keep code-wired paths
+
+Ultra-tight, latency-critical loops where YAML parsing overhead, dynamic reflection, or extra checks are too costly (rare for S0 batch).
+
+Highly bespoke jobs with unusual control flow (then write a specialized hook and call it from a minimal YAML).
+
+recommended guardrails (quick wins)
+
+YAML schema check in CI (fail on unknown keys, missing required blocks).
+
+Strict key names in transform output; validate with schemaMatch on the step you materialize.
+
+Version & pin hooks: e.g., POC.Hooks.S0.Transform.v1.Module so you can ship v2 alongside during transitions.
+
+Secrets: never store credentials in YAML; use ${params.connStr} from env/KeyVault.
+
+Idempotent writes: you’re already using TVP + MERGE + keys—keep it.
+
+Runbook: “How to dry-run a YAML, read logs, and re-run with a different batchId”.
+
+bottom line
+
+For S0 (and most batch workflows), the YAML-first + small hooks architecture gives you:
+
+faster changes (edit YAML, not code),
+
+safer runs (validations + idempotent materialize),
+
+easier ops (cron + logging),
+
+better reproducibility.
+
+It’s a clear upgrade over the old monolithic, code-wired implementation. If you want, I can add a tiny mmts validate <yaml> CLI that runs parse + interpolation + hook resolution + a schema dry-run, so every edit is “green” before it hits the scheduler.
+
+ChatGPT can make
 ///////////////////////////////////////////////////
 

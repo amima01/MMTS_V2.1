@@ -1,0 +1,404 @@
+﻿///////////////////////////////////////////////////
+there is an idea of turning the transformations into executables, 
+because there are many ways to calculate a wave, using a range of parameters...
+so there can be many executable compiled using different settings...like a pass-thru...what do you thinks?
+///////////////////////////////////////////////////
+Love this idea. Turning transformations into pluggable executables (“wave engines”) 
+fits your YAML engine perfectly and buys you isolation, easy A/B testing, and language freedom.
+
+Here’s how I’d structure it so it’s robust and ergonomic.
+
+Why executables (EXEs) help
+
+Isolation & safety: a bad transform can’t crash the scheduler; you get timeouts/retries.
+
+Polyglot: write wave engines in F#/C++/Python — whatever’s best for the math.
+
+A/B variants: ship many engines with different params (or compiled constants) and pick per YAML.
+
+Reproducibility: pin an exe + args in YAML ⇒ exact behavior is captured in git.
+
+Contract: stdin → stdout (rows/json)
+
+Use your existing Exec.Exe path (you already support stdin: rows, stdout: rows, timeouts, retry). The contract:
+
+stdin: JSON array of rows (what s0.fetch produced or previous step’s output)
+
+stdout: JSON array of rows (what the wave exe outputs)
+
+exit code: 0=success; non-zero = failure (stderr captured by engine)
+
+schema: your transform should output S0_Cadence31 shaped rows if you plan to materialize into that table.
+
+Example YAML
+
+One fetch → multiple wave executables in parallel, then union → validate → materialize:
+///////////////////////////////////////////////////
+steps:
+  - id: s0.fetch
+    uses: "s0.fetch"
+    args:
+      connStr: "${params.connStr}"
+      symbol:  "AAPL"
+      t0:      "2025-01-01"
+      t1:      "2025-09-13"
+    out: { rows: "step:s0.fetch.rows" }
+
+  - parallel:
+      - id: wave.fast
+        uses:
+          type: "exe"
+          path: "./waves/wave_fast.exe"
+          args: ["--stat", "CL", "--window", "31", "--robust", "false"]
+          stdin: "rows"
+          stdout: "rows"
+          timeout: "00:02:00"
+          retry: { max: 2, delay: "00:00:05", backoff: 2.0 }
+        in:  { rows: "step:s0.fetch.rows" }
+        out: { rows: "step:wave.fast.rows" }
+
+      - id: wave.robust
+        uses:
+          type: "exe"
+          path: "./waves/wave_robust.exe"
+          args: ["--stat", "CL", "--window", "31", "--robust", "true", "--mad-scale", "1.4826"]
+          stdin: "rows"
+          stdout: "rows"
+          timeout: "00:03:00"
+          retry: { max: 2, delay: "00:00:05", backoff: 2.0 }
+        in:  { rows: "step:s0.fetch.rows" }
+        out: { rows: "step:wave.robust.rows" }
+    parallelism: 2  # run both at once
+
+  - id: wave.union
+    uses: "POC.Hooks.Util.Rows.Union.v1.Module"   # tiny helper: concat row arrays
+    in:  { rows: "step:wave.fast.rows" }          # your Exec can already union by passing both; or write a small hook
+    args:
+      other: "step:wave.robust.rows"
+    out: { rows: "step:wave.union.rows" }
+
+validations:
+  - id: v2
+    on: "step:wave.union.rows"
+    rule: "schemaMatch(DataFeed, Symbol, StatName, DataField, TradeDate, Dt, Raw, Med, Mad, Scale, MZ, Weight, Clean, Cadence, Source)"
+
+materialize:
+  - from:   "step:wave.union.rows"
+    to:     "table:s0_out"
+    mode:   "${params.emitMode}"
+    key:    ["DataFeed","Symbol","StatName","Dt","DataField"]
+
+///////////////////////////////////////////////////
+You can parameter-sweep by foreach too (e.g., window sizes), then emit StatName = CL_w31, CL_w63, etc.
+
+Minimal EXE template (F#)
+
+A tiny console app that reads rows JSON from stdin and writes Cadence-31 rows JSON to stdout. 
+You can copy this for each variant and just change the algorithm/params.
+///////////////////////////////////////////////////
+open System
+open System.IO
+open System.Text.Json
+
+type Row = System.Collections.Generic.Dictionary<string,obj>
+type Rows = Row list
+
+let readStdin () =
+    use sr = new StreamReader(Console.OpenStandardInput())
+    sr.ReadToEnd()
+
+let writeStdout (json:string) =
+    use sw = new StreamWriter(Console.OpenStandardOutput())
+    sw.Write(json)
+    sw.Flush()
+
+let tryGet<'T> (k:string) (r:Row) =
+    match r.TryGetValue k with
+    | true, v ->
+        try Some (v :?> 'T) with _ -> None
+    | _ -> None
+
+let getDt k r = tryGet<string> k r |> Option.bind (fun s -> match DateTime.TryParse s with | true,dt -> Some dt | _ -> None)
+                             |> Option.orElse (tryGet<DateTime> k r)
+                             |> Option.defaultValue DateTime.MinValue
+let getF k r =
+    match r.TryGetValue k with
+    | true, v ->
+        match v with
+        | :? float as f   -> f
+        | :? double as d  -> d
+        | :? single as s  -> float s
+        | :? int as i     -> float i
+        | :? int64 as i64 -> float i64
+        | :? decimal as m -> float m
+        | :? string as s  -> match Double.TryParse s with | true,x -> x | _ -> Double.NaN
+        | _ -> Double.NaN
+    | _ -> Double.NaN
+
+[<EntryPoint>]
+let main argv =
+    try
+        // parse CLI args
+        let stat    = argv |> Array.tryFindIndex ((=) "--stat")    |> Option.bind (fun i -> if i+1 < argv.Length then Some argv.[i+1] else None) |> Option.defaultValue "CL"
+        let window  = argv |> Array.tryFindIndex ((=) "--window")  |> Option.bind (fun i -> if i+1 < argv.Length then Some (int argv.[i+1]) else None) |> Option.defaultValue 31
+        let robust  = argv |> Array.exists ((=) "--robust")
+        let dataField = if robust then "WAVE_ROBUST" else "WAVE_FAST"
+
+        // read input rows
+        let inputJson = readStdin ()
+        let optsIn = JsonSerializerOptions(PropertyNameCaseInsensitive = true)
+        let rows : Rows =
+            if String.IsNullOrWhiteSpace inputJson then [] else
+            JsonSerializer.Deserialize<Rows>(inputJson, optsIn)
+
+        // group by (DataFeed, Symbol)
+        let groups =
+            rows
+            |> List.groupBy (fun r ->
+                (r.["DataFeed"] :?> string), (r.["Symbol"] :?> string))
+
+        let outRows =
+            groups
+            |> List.collect (fun ((feed,symbol), rs) ->
+                // build (Dt, value) from chosen stat
+                let series =
+                    rs |> List.map (fun r ->
+                        let dt = getDt "T" r
+                        let v =
+                            match stat with
+                            | "CL" -> getF "C" r
+                            | "OP" -> getF "O" r
+                            | "HI" -> getF "H" r
+                            | "LO" -> getF "L" r
+                            | "VO" -> getF "V" r
+                            | "WAP"-> match tryGet<float> "Wap" r with Some x -> x | None -> (getF "O" r + getF "H" r + getF "L" r + getF "C" r)/4.0
+                            | _    -> getF "C" r
+                        dt, v)
+                    |> List.sortBy fst
+
+                // run your wave here (placeholder: simple rolling median/scale)
+                // Replace with your real implementation!
+                let smooth (w:int) (xs:(DateTime*float) list) =
+                    let a = xs |> List.toArray
+                    [ for i in 0 .. a.Length-1 ->
+                        let lo = max 0 (i - w/2)
+                        let hi = min (a.Length-1) (i + w/2)
+                        let windowVals = [| for j in lo .. hi -> snd a.[j] |]
+                        let raw = snd a.[i]
+                        let med = Array.sort windowVals |> fun s -> s.[s.Length/2]
+                        let mad = windowVals |> Array.averageBy (fun v -> abs (v - med))
+                        let scale = if mad = 0.0 then 1.0 else mad
+                        let mz = (raw - med) / scale
+                        let wgt = 1.0
+                        let clean = raw - mz * 0.0
+                        let cad = med
+                        fst a.[i], raw, med, mad, scale, mz, wgt, clean, cad ]
+
+                let enriched =
+                    if robust then smooth window series else smooth window series
+
+                enriched
+                |> List.map (fun (dt, raw, med, mad, scale, mz, w, clean, cad) ->
+                    let r = Row()
+                    r.Add("DataFeed",  box feed)
+                    r.Add("Symbol",    box symbol)
+                    r.Add("StatName",  box stat)
+                    r.Add("DataField", box dataField)
+                    r.Add("TradeDate", box dt.Date)
+                    r.Add("Dt",        box dt)
+                    r.Add("Raw",       box raw)
+                    r.Add("Med",       box med)
+                    r.Add("Mad",       box mad)
+                    r.Add("Scale",     box scale)
+                    r.Add("MZ",        box mz)
+                    r.Add("Weight",    box w)
+                    r.Add("Clean",     box clean)
+                    r.Add("Cadence",   box cad)
+                    r.Add("Source",    box dataField)
+                    r)
+
+            )
+
+        let optsOut = JsonSerializerOptions(PropertyNamingPolicy = JsonNamingPolicy.CamelCase)
+        writeStdout (JsonSerializer.Serialize(outRows, optsOut))
+        0
+    with ex ->
+        eprintfn "wave exe failed: %s" ex.Message
+        1
+
+///////////////////////////////////////////////////
+Swap the smooth placeholder for your real wave math (or link to your shared library). The point is the I/O contract, not the algo.
+
+Patterns for many variants
+
+Option A — many binaries: wave_fast.exe, wave_robust.exe, wave_exp.exe (each compiled with constants).
+Pros: deterministic, no arg parsing mistakes. Cons: more files.
+
+Option B — one binary, many args: wave.exe --stat CL --window 31 --algo robust.
+Pros: fewer files. Cons: rely on args for reproducibility (fine if YAML pins them).
+
+Option C — param grid: YAML foreach over params → one exe:
+///////////////////////////////////////////////////
+- id: waves.grid
+  foreach:
+    items:
+      - "--stat=CL --window=31 --robust=true"
+      - "--stat=CL --window=63 --robust=true"
+      - "--stat=WAP --window=31 --robust=false"
+    parallelism: 3
+  uses:
+    type: "exe"
+    path: "./waves/wave.exe"
+    args: ["${item}"]          # engine splits item into args
+    stdin: "rows"
+    stdout: "rows"
+  in:  { rows: "step:s0.fetch.rows" }
+  out: { rows: "step:waves.grid.rows" }
+
+///////////////////////////////////////////////////
+Operational guardrails
+
+Timeouts + retries per step (you’ve got this).
+
+Non-overlapping runs in the scheduler (done).
+
+Resource caps: consider separate process-level limits (e.g., Job Objects on Windows) if needed.
+
+Version pinning: include exe filename with semantic version, or store a version string inside the exe and print it in the first log line.
+
+Self-test: support --selftest to run a built-in check and exit 0/1 for CI.
+
+Telemetry: have exes print a one-line summary to stderr (captured in your logs when failures happen).
+
+Schema tests: keep schemaMatch on the materialize step so any drift is caught before DB.
+
+Verdict: Your YAML engine already supports exe steps; leaning into that for wave engines is a great fit. 
+You can iterate fast, compare methods head-to-head, and keep the core runner simple and stable.
+///////////////////////////////////////////////////
+100% agree. You’ve turned a tangle of code paths into a modular, human-readable system: YAML describes what to do, and tiny hooks/executables do how. That’s exactly what you want when ML enters the chat.
+
+Here’s how I’d lock it in and grow it safely:
+
+What stays stable (the “contract”)
+
+Step I/O = Rows: fetch → transform → materialize all speak the same simple shape (list of maps).
+
+Engines are modules: dotnet hooks or executables with a tiny contract (stdin rows → stdout rows, exit code).
+
+Validation before writes: nonempty, schemaMatch, unique, etc., so bad data never reaches the DB.
+
+Scheduling & logs: the runtime (scheduler + Serilog) is boring, reliable plumbing.
+
+How to evolve the parser without pain
+
+Version the spec: keep version: "1.x". Add features as optional roots so older YAMLs still parse.
+
+Additive roots (examples you’ll likely want soon):
+
+artifacts: where to save CSV/Parquet/intermediate rows.
+
+engines: named executables with defaults (path/args/env), referenced by steps.
+
+metrics: computed after steps (row counts, null ratios, drift), surfaced in logs.
+
+notify: (email/Slack/webhook) on success/failure.
+
+secrets: indirection to env/KeyVault names, never inline creds.
+
+Soft-checks: keep your expectScalar, tree dumper, hooks registry printer, and result schema peeker—these make YAML mistakes easy to spot.
+
+CI “validate”: a tiny CLI that runs parse+interpolate+hook resolution+dry-run schema check on PRs.
+
+ML integration (clean path)
+
+Feature steps: transforms that output wide/typed feature rows (with a schemaMatch).
+
+Train/eval as engines: call exe (Python/.NET) for train and predict steps; output metrics + predictions as rows.
+
+Materialize predictions: a standard table (e.g., [dbo].[Predictions]) with keys + batchId.
+
+Experiment tracking: add a metrics: root and have engines emit a small {key,value} row set to log/DB.
+
+Example: small, extensible YAML
+///////////////////////////////////////////////////
+workflow: "S0_MMTS_ML"
+version:  "1.1"
+description: "S0 with pluggable wave engines + ML scoring"
+
+params:
+  envName:  "dev"
+  connStr:  "${params.connStr}"   # resolved by runner
+  batchId:  "2025-09-14"
+  emitMode: "bulk_upsert"
+
+engines:
+  wave_robust:
+    path: "./waves/wave.exe"
+    args: ["--algo","robust","--window","31"]
+    timeout: "00:03:00"
+
+steps:
+  - id: s0.fetch
+    uses: "s0.fetch"
+    args: { connStr: "${params.connStr}", symbol: "AAPL", t0: "2025-01-01", t1: "2025-09-13" }
+    out:  { rows: "step:s0.fetch.rows" }
+
+  - id: s0.wave
+    uses:
+      type: "exe"
+      path: "${engines.wave_robust.path}"
+      args: ${engines.wave_robust.args}
+      stdin: "rows"
+      stdout: "rows"
+      timeout: "${engines.wave_robust.timeout}"
+    in:  { rows: "step:s0.fetch.rows" }
+    out: { rows: "step:s0.wave.rows" }
+
+  - id: s0.score
+    uses:
+      type: "exe"
+      path: "./ml/score.exe"
+      args: ["--model","models/s0.onnx"]
+      stdin: "rows"
+      stdout: "rows"
+      timeout: "00:02:00"
+    in:  { rows: "step:s0.wave.rows" }
+    out: { rows: "step:s0.score.rows" }
+
+validations:
+  - { id: v_nonempty, on: "step:s0.wave.rows",  rule: "nonempty" }
+  - { id: v_schema,   on: "step:s0.wave.rows",  rule: "schemaMatch(DataFeed, Symbol, StatName, DataField, TradeDate, Dt, Raw, Med, Mad, Scale, MZ, Weight, Clean, Cadence, Source)" }
+  - { id: v_score,    on: "step:s0.score.rows", rule: "nonempty" }
+
+materialize:
+  - { from: "step:s0.wave.rows",  to: "table:s0_out", mode: "${params.emitMode}", key: ["DataFeed","Symbol","StatName","Dt","DataField"] }
+  - { from: "step:s0.score.rows", to: "table:s0_pred", mode: "${params.emitMode}", key: ["Symbol","Dt","StatName"] }
+
+schedule: { cron: "0 0/10 * * * ?" }
+
+///////////////////////////////////////////////////
+Migration checklist (quick wins)
+
+Keep your current hooks; add new engines as exe steps where needed.
+
+Put schemaMatch at the step you write from.
+
+Add dumpHooks, dumpResults, dumpSchemaDiff to every run (dev) so issues are obvious.
+
+For breaking parser changes, bump version: and support both for a while.
+
+Yep—easier for humans, safer for ops, friendlier to ML. 
+And when you need to evolve, you add a root or a tiny hook, not a refactor of the world. 
+Ready to codify the engines: root and a mmts validate CLI next?
+///////////////////////////////////////////////////
+
+///////////////////////////////////////////////////
+
+///////////////////////////////////////////////////
+
+///////////////////////////////////////////////////
+
+///////////////////////////////////////////////////
+
+
+

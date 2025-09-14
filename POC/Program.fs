@@ -41,10 +41,114 @@ module Program =
     open System.Threading
     open System.Threading.Tasks
     open POC.Log
-    open POC.Schedule
-    
+    open POC.Schedule    
     open MMTS.ML.Types
     open MMTS.ML.Runner
+
+    // -----------------------------
+    // Stubs for side-effects used by Exec
+    // -----------------------------
+    let private sqlExec : MMTS.ML.Exec.SqlExec =
+        fun sql -> Log.infof "[sqlExec] %s" sql
+
+    let private bulkEmit : MMTS.ML.Exec.BulkEmit =
+        fun args ->
+            let count = args.rows |> List.length
+            Log.infof "[bulkEmit] mode=%s table=%s rows=%d keys=%A conn=(%s)"
+                      args.mode args.table count args.key args.conn
+    
+    // -----------------------------
+    // One-shot runner (reads YAML and executes it once)
+    // -----------------------------
+    let private runS0Once (yamlPath: string) : Task =
+        task {
+            try
+                let full = Path.GetFullPath yamlPath
+                if not (File.Exists full) then
+                    Log.errorf "YAML not found: %s" full
+                else
+                    let yaml = File.ReadAllText full
+                    // Parse + interpolate (apply a few convenient overrides)
+                    let spec0   = MMTS.ML.Parse.load yaml
+                    let p0      = spec0.parameters
+                    let p'      =
+                        { p0 with
+                            batchId = DateTime.Today.ToString("yyyy-MM-dd")
+                            hookNs  = if String.IsNullOrWhiteSpace p0.hookNs then "POC.Hooks" else p0.hookNs
+                            impl    = if String.IsNullOrWhiteSpace p0.impl   then "v1"        else p0.impl }
+                    let spec    = { spec0 with parameters = p' } |> MMTS.ML.Parse.interpolateAll
+                    
+                    HooksDebug.dumpHooks spec
+
+                    // Build exec env, run, log summaries
+                    let env =
+                        { MMTS.ML.Exec.spec     = spec
+                          MMTS.ML.Exec.stepRows = System.Collections.Concurrent.ConcurrentDictionary<string, Rows>()
+                          MMTS.ML.Exec.sqlExec  = sqlExec
+                          MMTS.ML.Exec.bulkEmit = bulkEmit }
+
+                    MMTS.ML.Exec.run env
+
+                    ResultsDebug.dumpResults env.stepRows
+                    
+
+                    // Summaries
+                    env.stepRows
+                    |> Seq.map (fun kv -> kv.Key, kv.Value.Length)
+                    |> Seq.sortBy fst
+                    |> Seq.iter (fun (k, n) -> Log.infof "[result] step=%s rows=%d" k n)
+
+            
+            with ex ->
+                if ex.Message.StartsWith("Validation failed") then
+                    // try to dump the transform step’s schema
+                    let expected = [
+                      "DataFeed"; "Symbol"; "StatName"; "DataField"; "TradeDate"; "Dt";
+                      "Raw"; "Med"; "Mad"; "Scale"; "MZ"; "Weight"; "Clean"; "Cadence"; "Source"
+                    ]
+
+                    match env.stepRows.TryGetValue "s0.transform" with
+                    | true, r -> ResultsDebug.dumpSchemaDiff "s0.transform" r expected
+                    | _ -> Log.error "no rows stored for step 's0.transform'"
+                    Log.errorf "S0 run failed: %s %A" ex.Message expected
+                else
+                    Log.errorf "S0 run failed: %s %A" ex.Message expected
+        }
+    
+    // -----------------------------
+    // Create a ScheduledJob for S0 based on YAML's schedule.cron
+    // (falls back to every 5 minutes if missing)
+    // -----------------------------
+    let private makeS0Job (yamlPath: string) : ScheduledJob =
+        // read cron from YAML if present
+        let cronExpr =
+            try
+                let yaml = File.ReadAllText yamlPath
+                let spec = MMTS.ML.Parse.load yaml
+                match spec.schedule with
+                | Some s when not (String.IsNullOrWhiteSpace s.cron) -> s.cron
+                | _ -> "0 0/5 * * * ?" // default: every 5 minutes
+            with _ ->
+                "0 0/5 * * * ?"
+
+        // guard against overlapping executions
+        let running = ref 0
+        let action () : Task = task {
+            if Interlocked.Exchange(running, 1) = 1 then
+                Log.warn "S0 job skipped; previous run still in progress."
+            else
+                try
+                    Log.infof "S0 scheduled run starting (cron=%s)" cronExpr
+                    do! runS0Once yamlPath
+                    Log.info "S0 scheduled run completed."
+                finally
+                    running := 0
+        }
+        { 
+            Id = "s0_workflow"
+            Schedule = Cron cronExpr
+            Action = action
+        }
 
     // ---------- helpers ----------
     let private previewFile (path:string) (maxLines:int) =
@@ -158,7 +262,17 @@ module Program =
             Log.errorf "YAML run aborted: %s" ex.Message
             // Do not rethrow; allow app to continue (e.g., start scheduler)
             ()
-
+    // -----------------------------
+    // Heartbeat job (unchanged)
+    // -----------------------------
+    let private heartbeatJob : ScheduledJob =
+        ScheduledJob.ofTask
+            "heartbeat"
+            (Interval (TimeSpan.FromSeconds 10.0))
+            (fun () -> task {
+                Log.infof "Heartbeat at %O" DateTime.Now
+                return ()
+            })
     // ---------- scheduler ----------
     let private startScheduler () =
         let jobs : ScheduledJob list =
@@ -170,7 +284,9 @@ module Program =
                       return ()
                   }) ]
         Schedule.run jobs
-
+    // -----------------------------
+    // Main
+    // -----------------------------
     [<EntryPoint>]
     let main argv =
         Log.init "POC" "logs"
@@ -178,20 +294,26 @@ module Program =
         // choose YAML path (allow override via --yaml "path")
         let yamlPath =
             let i = Array.FindIndex(argv, fun a -> a = "--yaml")
-            if i >= 0 && i + 1 < argv.Length then argv.[i+1] else @"DOC\S0_MMTS_ML.yaml"
+            if i >= 0 && i + 1 < argv.Length then argv.[i+1] else @"C:\MMTS_V2.1\YAML\S0_MMTS_ML_2025-09-13.txt"
 
-        let full = System.IO.Path.GetFullPath yamlPath
-        Log.infof "Reading YAML from: %s" full
-        
-        
+        let fullYaml = System.IO.Path.GetFullPath yamlPath
+        Log.infof "Reading YAML from: %s" fullYaml
 
         Log.infof "Attempting YAML run: %s" (Path.GetFullPath yamlPath)
         runYamlOnce yamlPath
 
-        // keep the app useful even if YAML failed
-        startScheduler ()
+        // (optional) run once at startup
+        runS0Once fullYaml
+        |> Async.AwaitTask
+        |> Async.RunSynchronously
+
+        // start scheduler with S0 job + heartbeat
+        let jobs = [ makeS0Job fullYaml; heartbeatJob ]
+        Schedule.run jobs
+
         Console.WriteLine("Scheduler started. Press ENTER to exit.")
         Console.ReadLine() |> ignore
+
 
         Log.close()
         0

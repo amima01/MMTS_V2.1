@@ -6,12 +6,13 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <Compile Include="hooks_S0_transform.fs" />
-	<Compile Include="hooks_S0_fetch.fs" />
     <Compile Include="sal_log.fs" />
     <Compile Include="sal_retry.fs" />
     <Compile Include="sal_scheduler.fs" />    
-    <Compile Include="sal_main_schedule_AndLogs.fs" />
+    <Compile Include="sal_main_schedule_AndLogs.fs" />    
+    <Compile Include="hooks_S0_transform.fs" />    
+    <Compile Include="hooks_S0_fetch.fs" />    
+    <Compile Include="Hooks_debug.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 	<ItemGroup>
@@ -26,6 +27,7 @@
   </ItemGroup>
 
 	<ItemGroup>
+	  <ProjectReference Include="..\MMTS.S0.Worker\MMTS.S0.Worker.fsproj" />
 	  <ProjectReference Include="..\MMTS\MMTS.fsproj" />
 	</ItemGroup>
 

@@ -1082,6 +1082,9 @@ module Runner =
         let spec0 = Parse.load yaml
         let spec1 = { spec0 with parameters = applyOverrides spec0.parameters opt.overrideParams }
         let spec  = Parse.interpolateAll spec1
+        
+        
+        
 
         let env =
             { Exec.spec     = spec

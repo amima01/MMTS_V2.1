@@ -4,8 +4,8 @@ description: "S0 batch workflow"
 
 params:
   envName:  "dev"
-  dbName:   "MMTS_DB"
-  connStr:  "Server=.;Database=MMTS_DB;Trusted_Connection=True;Encrypt=False"
+  dbName:   "0_Cadence"
+  connStr:  "Server=HP9;Database=0_Cadence;User Id=sa;Password=admin;Encrypt=False;TrustServerCertificate=True"
   hookNs:   "POC.Hooks"          # Program overrides to this anyway
   impl:     "v1"
   batchId:  "2025-09-13"
@@ -14,7 +14,7 @@ params:
 datasources:
   default:
     kind: "mssql"
-    conn: "Server=.;Database=MMTS_DB;Trusted_Connection=True;Encrypt=False"
+    conn: "Server=HP9;Database=0_Cadence;User Id=sa;Password=admin;Encrypt=False;TrustServerCertificate=True"
 
 tables:
   s0_out:
@@ -31,14 +31,18 @@ hooks:
     func:   "Run"
     kind:   "rows"
 
+
 steps:
   - id: s0.fetch
-    uses: "s0.fetch"        # HookKey ? resolves via hooks map
+    uses: "s0.fetch"
     args:
-      batchId: "${params.batchId}"
+      connStr: "${params.connStr}"
+      symbol:  "AAPL"
+      t0:      "2024-01-01"
+      t1:      "2024-12-31"
+      feeds:   "EOD1Day_YAHOO,EOD1Day_IBRK"
     out:
       rows: "step:s0.fetch.rows"
-
   - id: s0.transform
     uses:
       module: "POC.Hooks.S0.Transform.v1.Module"  # DotNet form also OK
@@ -50,13 +54,16 @@ steps:
     out:
       rows: "step:s0.transform.rows"
 
+
 validations:
   - id: v1
     on:   "step:s0.fetch.rows"
     rule: "nonempty"
+
+  # validate the exact shape you're about to materialize
   - id: v2
     on:   "step:s0.transform.rows"
-    rule: "schemaMatch(Symbol, Price, Ts, BatchId, PriceZ, Impl)"
+    rule: "schemaMatch(DataFeed, Symbol, StatName, DataField, TradeDate, Dt, Raw, Med, Mad, Scale, MZ, Weight, Clean, Cadence, Source)"
 
 materialize:
   - from:  "step:s0.transform.rows"

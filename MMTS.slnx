@@ -3,10 +3,12 @@
   <Folder Name="/Doc/chats/">
     <File Path="CHATS/chats_2025-09-12.txt" />
     <File Path="CHATS/chats_2025-09-13.txt" />
+    <File Path="chats_2025-09-14.txt" />
   </Folder>
   <Folder Name="/Doc/yaml/">
     <File Path="YAML/S0_MMTS_ML_2025-09-13.txt" />
   </Folder>
+  <Project Path="MMTS.S0.Worker/MMTS.S0.Worker.fsproj" Id="5e4e00c3-235e-4d6c-9d15-4cb315a80557" />
   <Project Path="MMTS/MMTS.fsproj" />
   <Project Path="POC/POC.fsproj" />
 </Solution>
