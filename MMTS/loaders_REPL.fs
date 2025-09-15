@@ -9,113 +9,6 @@ open System.Collections.Generic
 open System.Text.RegularExpressions
 open YamlDotNet.RepresentationModel
 
-// -----------------------------
-// Types (AST)
-// -----------------------------
-module Types =
-    type Params =
-        { envName   : string
-          dbName    : string
-          connStr   : string
-          hookNs    : string
-          impl      : string
-          batchId   : string
-          emitMode  : string }
-
-    type DataSource = { kind: string; conn: string }
-    type TableRef   = { ds: string; name: string }
-
-    type Hook =
-        { moduleName: string
-          func      : string
-          kind      : string } // "rows"
-
-    type StepIO = { rows: string option } // minimal I/O for now
-
-    // ---- execution kinds and options ----
-    type RetrySpec =
-        { max     : int
-          delay   : System.TimeSpan
-          backoff : float }     // e.g., 2.0 means exponential backoff
-
-    type IoKind = Nonx | Rows | Json
-
-    type DotNetUse =
-        { typeName : string
-          method   : string }  // defaults to "Run" if omitted
-
-    type ExeUse =
-        { path    : string
-          args    : string list
-          stdin   : IoKind
-          stdout  : IoKind
-          timeout : System.TimeSpan
-          retry   : RetrySpec option }
-
-    type Use =
-        | HookKey of string      // back-compat: key into hooks map
-        | DotNet  of DotNetUse   // in-process: static method
-        | Exe     of ExeUse      // out-of-process: spawn exe
-
-    // ---- foreach fan-out inside a step ----
-    // Supports either:
-    //   - over: "rows:step:<id>.rows" | "args:<key>" | "range:<start>..<stop>" | "file:<path>" | "env:<VAR>" | "json:<[...array…]>"
-    //   - items: [ "A", "B", "C" ]          (inline list)
-    type ForeachSpec =
-        { over        : string option
-          items       : string list option
-          parallelism : int option } // max concurrent items; None/<=1 = sequential
-
-    // A single executable step
-    type Step =
-        { id       : string
-          uses     : Use
-          ``in``   : StepIO option
-          args     : Map<string,string>
-          foreach  : ForeachSpec option
-          out      : StepIO option }
-
-    // ---- parallel groups with DOP ----
-    type ParallelGroup =
-        { steps       : Step list
-          parallelism : int option }  // max concurrent child steps; None/<=1 = sequential; 0/unset -> unbounded
-
-    type StepNode =
-        | Single   of Step
-        | Parallel of ParallelGroup
-
-    type Validation =
-        { id  : string
-          on  : string
-          rule: string }
-
-    type Materialize =
-        { from    : string
-          ``to``  : string
-          mode    : string
-          key     : string list
-          preSql  : string option
-          postSql : string option }
-
-    // ---- cron schedule at workflow level ----
-    type ScheduleSpec = { cron: string }
-
-    type Spec =
-        { workflow    : string
-          version     : string
-          description : string
-          parameters  : Params
-          datasources : Map<string, DataSource>
-          tables      : Map<string, TableRef>
-          hooks       : Map<string, Hook>
-          steps       : StepNode list
-          validations : Validation list
-          materialize : Materialize list
-          schedule    : ScheduleSpec option }
-
-    // Data rows flowing through the pipeline
-    type Row  = Map<string,obj>
-    type Rows = Row list
 
 // -----------------------------
 // YAML helpers
@@ -186,7 +79,7 @@ module Interp =
 // -----------------------------
 // YAML -> AST
 // -----------------------------
-module Parse =
+module Parse2 =
     open Types
     open Y
     open Interp
@@ -631,7 +524,7 @@ module Validate =
 // -----------------------------
 // Execution (hooks + materialize + exe bolts + parallel/foreach)
 // -----------------------------
-module Exec =
+module Exec2 =
     open System
     open System.Diagnostics
     open System.Text
@@ -1061,12 +954,12 @@ module Exec =
 // -----------------------------
 module Runner =
     open Types    open Parse
-    open Exec
+    open Exec2
 
     type Options =
         { overrideParams : Map<string,string>
-          sqlExec        : Exec.SqlExec
-          bulkEmit       : Exec.BulkEmit }
+          sqlExec        : Exec2.SqlExec
+          bulkEmit       : Exec2.BulkEmit }
 
     let private applyOverrides (p:Params) (ov:Map<string,string>) =
         let g k d = ov |> Map.tryFind k |> Option.defaultValue d
@@ -1079,20 +972,20 @@ module Runner =
           emitMode = g "emitMode" p.emitMode }
 
     let runFromYaml (yaml:string) (opt:Options) =
-        let spec0 = Parse.load yaml
+        let spec0 = Parse2.load yaml
         let spec1 = { spec0 with parameters = applyOverrides spec0.parameters opt.overrideParams }
-        let spec  = Parse.interpolateAll spec1
+        let spec  = Parse2.interpolateAll spec1
         
         
         
 
         let env =
-            { Exec.spec     = spec
+            { Exec2.spec     = spec
               stepRows      = System.Collections.Concurrent.ConcurrentDictionary<string, Types.Rows>()
               sqlExec       = opt.sqlExec
               bulkEmit      = opt.bulkEmit }
 
-        Exec.run env
+        Exec2.run env
         env // return env if caller wants to inspect stepRows
 
     

@@ -4,12 +4,17 @@
     <File Path="CHATS/chats_2025-09-12.txt" />
     <File Path="CHATS/chats_2025-09-13.txt" />
     <File Path="CHATS/chats_2025-09-14.txt" />
+    <File Path="CHATS/chats_2025-09-15.txt" />
   </Folder>
   <Folder Name="/Doc/yaml/">
     <File Path="S0_MMTS_ML_2025-09-14.txt" />
     <File Path="YAML/S0_MMTS_ML_2025-09-13.txt" />
   </Folder>
+  <Project Path="Engine0/Engine0.fsproj" Id="e4441291-e742-4ccc-b039-c60ec43ca7e7" />
+  <Project Path="Engine1A/Engine1A.fsproj" Id="2fa57b2e-1813-4cba-9f6d-56ae36351a59" />
+  <Project Path="Engine1B/Engine1B.fsproj" Id="2b30d7e5-a6d2-44cc-b2be-2e337c310452" />
   <Project Path="MMTS.S0.Worker/MMTS.S0.Worker.fsproj" Id="5e4e00c3-235e-4d6c-9d15-4cb315a80557" />
+  <Project Path="MMTS.Tests/MMTS.Tests.fsproj" Id="cd365e30-9f9d-4028-a866-1e110da03af8" />
   <Project Path="MMTS/MMTS.fsproj" />
   <Project Path="POC/POC.fsproj" />
 </Solution>

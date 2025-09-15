@@ -48,10 +48,10 @@ module Program =
     // -----------------------------
     // Stubs for side-effects used by Exec
     // -----------------------------
-    let private sqlExec : MMTS.ML.Exec.SqlExec =
+    let private sqlExec : MMTS.ML.Exec2.SqlExec =
         fun sql -> Log.infof "[sqlExec] %s" sql
 
-    let private bulkEmit : MMTS.ML.Exec.BulkEmit =
+    let private bulkEmit : MMTS.ML.Exec2.BulkEmit =
         fun args ->
             let count = args.rows |> List.length
             Log.infof "[bulkEmit] mode=%s table=%s rows=%d keys=%A conn=(%s)"
@@ -69,25 +69,25 @@ module Program =
                 else
                     let yaml = File.ReadAllText full
                     // Parse + interpolate (apply a few convenient overrides)
-                    let spec0   = MMTS.ML.Parse.load yaml
+                    let spec0   = MMTS.ML.Parse2.load yaml
                     let p0      = spec0.parameters
                     let p'      =
                         { p0 with
                             batchId = DateTime.Today.ToString("yyyy-MM-dd")
                             hookNs  = if String.IsNullOrWhiteSpace p0.hookNs then "POC.Hooks" else p0.hookNs
                             impl    = if String.IsNullOrWhiteSpace p0.impl   then "v1"        else p0.impl }
-                    let spec    = { spec0 with parameters = p' } |> MMTS.ML.Parse.interpolateAll
+                    let spec    = { spec0 with parameters = p' } |> MMTS.ML.Parse2.interpolateAll
                     
                     HooksDebug.dumpHooks spec
 
                     // Build exec env, run, log summaries
                     let env =
-                        { MMTS.ML.Exec.spec     = spec
-                          MMTS.ML.Exec.stepRows = System.Collections.Concurrent.ConcurrentDictionary<string, Rows>()
-                          MMTS.ML.Exec.sqlExec  = sqlExec
-                          MMTS.ML.Exec.bulkEmit = bulkEmit }
+                        { MMTS.ML.Exec2.spec     = spec
+                          MMTS.ML.Exec2.stepRows = System.Collections.Concurrent.ConcurrentDictionary<string, Rows>()
+                          MMTS.ML.Exec2.sqlExec  = sqlExec
+                          MMTS.ML.Exec2.bulkEmit = bulkEmit }
 
-                    MMTS.ML.Exec.run env
+                    MMTS.ML.Exec2.run env
 
                     ResultsDebug.dumpResults env.stepRows
                     
@@ -100,17 +100,13 @@ module Program =
 
             
             with ex ->
+                let expected = [
+                    "DataFeed"; "Symbol"; "StatName"; "DataField"; "TradeDate"; "Dt";
+                    "Raw"; "Med"; "Mad"; "Scale"; "MZ"; "Weight"; "Clean"; "Cadence"; "Source"
+                  ]
                 if ex.Message.StartsWith("Validation failed") then
                     // try to dump the transform step’s schema
-                    let expected = [
-                      "DataFeed"; "Symbol"; "StatName"; "DataField"; "TradeDate"; "Dt";
-                      "Raw"; "Med"; "Mad"; "Scale"; "MZ"; "Weight"; "Clean"; "Cadence"; "Source"
-                    ]
-
-                    match env.stepRows.TryGetValue "s0.transform" with
-                    | true, r -> ResultsDebug.dumpSchemaDiff "s0.transform" r expected
-                    | _ -> Log.error "no rows stored for step 's0.transform'"
-                    Log.errorf "S0 run failed: %s %A" ex.Message expected
+                    Log.errorf "S0 run [Validation] failed: %s %A" ex.Message expected
                 else
                     Log.errorf "S0 run failed: %s %A" ex.Message expected
         }
@@ -124,7 +120,7 @@ module Program =
         let cronExpr =
             try
                 let yaml = File.ReadAllText yamlPath
-                let spec = MMTS.ML.Parse.load yaml
+                let spec = MMTS.ML.Parse2.load yaml
                 match spec.schedule with
                 | Some s when not (String.IsNullOrWhiteSpace s.cron) -> s.cron
                 | _ -> "0 0/5 * * * ?" // default: every 5 minutes
@@ -181,7 +177,7 @@ module Program =
                            (previewFile yamlPath 40)
 
 
-                let (env: MMTS.ML.Exec.ExecEnv)  =
+                let (env: MMTS.ML.Exec2.ExecEnv)  =
                     try
                         // override a couple params so today's batch is used and hooks resolve to POC.Hooks
                         let overrides =
@@ -191,10 +187,10 @@ module Program =
                             |> Map.ofList
 
                         // stub side-effects
-                        let sqlExec : MMTS.ML.Exec.SqlExec =
+                        let sqlExec : MMTS.ML.Exec2.SqlExec =
                             fun sql -> Log.infof "[sqlExec] %s" sql
 
-                        let bulkEmit : MMTS.ML.Exec.BulkEmit =
+                        let bulkEmit : MMTS.ML.Exec2.BulkEmit =
                             fun args ->
                                 let count = args.rows |> List.length
                                 Log.infof "[bulkEmit] mode=%s table=%s rows=%d keys=%A conn=(%s)"
@@ -202,7 +198,7 @@ module Program =
 
                         // Parse + interpolate — catch YAML/shape errors cleanly
                         let spec0 =
-                            try MMTS.ML.Parse.load yaml
+                            try MMTS.ML.Parse2.load yaml
                             with ex ->
                                 Log.errorf "YAML parse failed: %s" ex.Message
                                 // extra hint for common root shape errors
@@ -216,16 +212,16 @@ module Program =
                                         { p with batchId = g "batchId" p.batchId
                                                  hookNs  = g "hookNs"  p.hookNs
                                                  impl    = g "impl"    p.impl } }
-                                    |> MMTS.ML.Parse.interpolateAll
+                                    |> MMTS.ML.Parse2.interpolateAll
 
                         // Execute via runner (this may raise on validation/materialize)
                         try
-                            let (env1: MMTS.ML.Exec.ExecEnv)  = { 
-                                    MMTS.ML.Exec.spec     = spec
-                                    MMTS.ML.Exec.stepRows = System.Collections.Concurrent.ConcurrentDictionary<string, MMTS.ML.Types.Rows>()
-                                    MMTS.ML.Exec.sqlExec  = sqlExec
-                                    MMTS.ML.Exec.bulkEmit = bulkEmit }
-                            MMTS.ML.Exec.run env1
+                            let (env1: MMTS.ML.Exec2.ExecEnv)  = { 
+                                    MMTS.ML.Exec2.spec     = spec
+                                    MMTS.ML.Exec2.stepRows = System.Collections.Concurrent.ConcurrentDictionary<string, MMTS.ML.Types.Rows>()
+                                    MMTS.ML.Exec2.sqlExec  = sqlExec
+                                    MMTS.ML.Exec2.bulkEmit = bulkEmit }
+                            MMTS.ML.Exec2.run env1
                             env1
                                             
                         with ex ->

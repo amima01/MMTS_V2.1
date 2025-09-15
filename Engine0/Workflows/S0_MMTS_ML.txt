@@ -1,0 +1,96 @@
+﻿# Engine0 / S0 skeleton — wired to POC hooks
+name: "S0_MMTS_ML"
+version: "1.0"
+
+# -------- Params (overridable via --set key=val) --------
+params:
+  env: "${ENV:ASPNETCORE_ENVIRONMENT|dev}"
+  batchId: "${NOW:yyyy-MM-dd}"
+  impl: "v1"
+  dataFeed: "EOD5Secs"
+  connStr: "${ENV:MMTS_TEST_CONNSTR|Server=.;Database=0_CADENCE;Trusted_Connection=True;Encrypt=False}"
+
+# Defaults for prepare keys/db (usable by hooks or materializer)
+prepare:
+  s0:
+    keys:
+      - "DataFeed"
+      - "Symbol"
+      - "StatName"
+      - "TradeDate"
+    db:
+      schema: "dbo"
+      target_table: "S0_Cadence31"
+
+# -------- Hook wiring --------
+hooks:
+  s0.fetch:
+    module: "POC.Hooks.S0.Fetch.v1.Module"
+    func: "Run"
+    kind: "rows"        # stdout rows or in-proc rows; Exec will normalize
+  s0.transform:
+    module: "POC.Hooks.S0.Transform.v1.Module"
+    func: "Run"
+    kind: "rows"        # rows-in → rows-out
+
+# -------- Steps (simple linear: fetch → transform → materialize) --------
+steps:
+  - id: "s0.fetch"
+    in:
+      io: "none"
+    out:
+      io: "rows"
+    args:
+      dataFeed: "${param:dataFeed}"
+      env: "${param:env}"
+      batchId: "${param:batchId}"
+      impl: "${param:impl}"
+
+  - id: "s0.transform"
+    in:
+      from: "s0.fetch"
+      io: "rows"
+    out:
+      io: "rows"
+    args:
+      env: "${param:env}"
+      impl: "${param:impl}"
+
+  - id: "s0.materialize"
+    kind: "materialize"
+    in:
+      from: "s0.transform"
+      io: "rows"
+    args:
+      connStr: "${param:connStr}"
+      db:
+        schema: "${prepare:s0.db.schema}"
+        target: "${prepare:s0.db.target_table}"
+      keys: "${prepare:s0.keys}"
+      mode: "bulk_upsert"
+      pre_sql: |
+        -- optional: run before bulk_upsert
+        -- e.g. ensure temp tables or switch partitions
+      post_sql: |
+        -- optional: run after bulk_upsert
+        -- e.g. ANALYZE / UPDATE STATS
+      # Optional schema/range/uniqueness validations at materialization boundary:
+      validate:
+        nonempty: true
+        schema:
+          columns:
+            - name: "DataFeed";   type: "nvarchar"
+            - name: "Symbol";     type: "nvarchar"
+            - name: "StatName";   type: "nvarchar"
+            - name: "TradeDate";  type: "datetime"
+            - name: "Raw";        type: "float"
+            - name: "Med";        type: "float"
+            - name: "Mad";        type: "float"
+        unique:
+          - ["DataFeed","Symbol","StatName","TradeDate"]
+
+# -------- Optional schedule (Quartz-like) --------
+# schedule:
+#   rrule: "FREQ=DAILY;BYHOUR=6;BYMINUTE=0;BYSECOND=0"
+#   timezone: "America/Chicago"
+

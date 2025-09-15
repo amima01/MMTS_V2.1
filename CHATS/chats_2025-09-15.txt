@@ -1,0 +1,2276 @@
+﻿Gem gem, the parser code stays in MMTS.ML, where the engine1A/1B/0 code belongs ?
+...
+Ahh I see where you’re drawing the boundary 👌
+
+Right now you’ve fixed MMTS.ML as the home for the parser + meta-language definitions (Types, Parse, Exec, REPL, hooks, validations, etc.). That’s good—keep that project/library focused purely on the orchestration layer.
+
+For the “engines” (0, 1A, 1B, etc.), here’s a sensible separation:
+////////////////////////////////////////////////////////////
+Suggested Solution Layout
+
+1. MMTS.ML (library)
+
+Contains:
+
+Types.fs (StepIO, IoKind, HookSpec, WorkflowSpec, etc.)
+
+Parse.fs (YAML → Types)
+
+Exec.fs (hook invocation, validations, materialization scaffolding)
+
+REPL utilities
+
+Purpose: generic runner + meta-language interpreter
+////////////////////////////////////////////////////////////
+2. Engine0, Engine1A, Engine1B (worker projects / services / executables)
+
+Each engine gets its own Visual Studio project (console app or service).
+
+These consume MMTS.ML as a library, so they can load workflows and run hooks.
+
+Contain:
+
+Program.fs (entrypoint)
+
+Engine-specific config (YAML or args)
+
+Engine-specific hook implementations (e.g. POC.Hooks.S0.Fetch.v1.Module)
+
+Possibly a small engine-specific scheduler/runner (Quartz.NET, cron, etc.)
+////////////////////////////////////////////////////////////
+3. POC.Hooks.* (library or per-engine subfolders)
+
+Where you put your actual computation logic:
+
+POC.Hooks.S0.Fetch.v1
+
+POC.Hooks.S0.Transform.v1
+
+POC.Hooks.S1.Prepare.v1
+
+These can live either:
+
+Inside each Engine project (if hooks are tightly coupled), or
+
+In a shared MMTS.Hooks library (if you want cross-engine reuse).
+////////////////////////////////////////////////////////////
+4. MMTS.Shared (optional library)
+
+All the common data types (RawData, StatEntry, WaveFit, etc.)
+
+SQL helpers, RetrySpec, utils
+
+So neither ML meta-language nor Engine projects duplicate code.
+////////////////////////////////////////////////////////////
+Rule of Thumb
+
+MMTS.ML = the grammar + executor of the meta-language.
+
+Engines (0/1A/1B) = concrete workers that run workflows defined in YAML.
+
+Hooks = domain-specific functions (calc wave, load raw, write SQL).
+
+Shared = reusable trading/math utilities.
+////////////////////////////////////////////////////////////
+So to your question:
+
+Keep parser code in MMTS.ML (as you said).
+
+Put engine0/1A/1B code into their own worker projects (each consuming MMTS.ML).
+
+Place hook implementations either in those worker projects or in a shared MMTS.Hooks library if you want them reusable.
+////////////////////////////////////////////////////////////
+Do you want me to draft a Visual Studio solution tree (with .fsproj per engine + refs to MMTS.ML) so you can just scaffold it?
+////////////////////////////////////////////////////////////
+MMTS.sln
+├─ solution-items/
+│  ├─ README.md
+│  ├─ .editorconfig
+│  ├─ .vsconfig
+│  └─ build/
+│     ├─ Directory.Build.props
+│     └─ Directory.Build.targets
+│
+├─ src/
+│  ├─ MMTS.Shared/                 # cross-cutting types & utils (SQL, math, logging)
+│  │  ├─ MMTS.Shared.fsproj
+│  │  └─ src/
+│  │     ├─ Types/
+│  │     │  ├─ CoreTypes.fs
+│  │     │  ├─ MarketTypes.fs
+│  │     │  └─ WaveTypes.fs
+│  │     ├─ Sql/
+│  │     │  ├─ SqlHelpers.fs
+│  │     │  └─ TvpHelpers.fs
+│  │     └─ Util/
+│  │        ├─ RetrySpec.fs
+│  │        └─ Logging.fs
+│  │
+│  ├─ MMTS.ML/                     # meta-language: Types/Parse/Exec/REPL
+│  │  ├─ MMTS.ML.fsproj
+│  │  └─ src/
+│  │     ├─ Types.fs               # IoKind, StepIO, HookSpec, WorkflowSpec, etc.
+│  │     ├─ Parse.fs               # YAML → Types (YamlDotNet)
+│  │     ├─ Exec.fs                # hook invocation, validations, emit/dryrun
+│  │     ├─ Materialize.fs         # bulk upsert, pre_sql/post_sql plumbing
+│  │     └─ Repl.fs                # REPL commands (:load/:run/:validate/…)
+│  │
+│  ├─ MMTS.Hooks/                  # reusable domain hooks (optional shared lib)
+│  │  ├─ MMTS.Hooks.fsproj
+│  │  └─ src/
+│  │     ├─ POC/
+│  │     │  ├─ Hooks.S0.Fetch.v1/      # namespace POC.Hooks.S0.Fetch.v1
+│  │     │  │  └─ Module.fs            # let Run (args: Map<string,string>) : obj = …
+│  │     │  ├─ Hooks.S0.Transform.v1/
+│  │     │  │  └─ Module.fs
+│  │     │  ├─ Hooks.S1.Prepare.v1/
+│  │     │  │  └─ Module.fs
+│  │     │  └─ Hooks.S2.Transform.v1/
+│  │     │     └─ Module.fs
+│  │     └─ Common/
+│  │        └─ HookUtil.fs
+│  │
+│  ├─ Engine0/                     # worker: S0 (ingest/prepare/materialize)
+│  │  ├─ Engine0.fsproj
+│  │  ├─ Program.fs                # entrypoint (batch or REPL pass-through)
+│  │  ├─ appsettings.json
+│  │  └─ workflows/
+│  │     └─ S0_MMTS_ML.yaml        # engine-owned workflow(s)
+│  │
+│  ├─ Engine1A/                    # worker: signal emission A (fast path)
+│  │  ├─ Engine1A.fsproj
+│  │  ├─ Program.fs
+│  │  └─ workflows/
+│  │     └─ S1A_MMTS_ML.yaml
+│  │
+│  ├─ Engine1B/                    # worker: signal emission B (alt path)
+│  │  ├─ Engine1B.fsproj
+│  │  ├─ Program.fs
+│  │  └─ workflows/
+│  │     └─ S1B_MMTS_ML.yaml
+│  │
+│  └─ MMTS.Tests/                  # unit + integration tests (xUnit)
+│     ├─ MMTS.Tests.fsproj
+│     └─ Tests/
+│        ├─ ParseTests.fs          # YAML parse & validation tests
+│        ├─ ExecHookTests.fs       # reflection invoke tests
+│        ├─ HooksSmokeTests.fs     # “prep” artifacts & IO flow tests
+│        └─ DbOptInTests.fs        # runs if MMTS_TEST_CONNSTR is set
+│
+└─ tools/
+   ├─ scripts/
+   │  ├─ build.ps1
+   │  ├─ build.sh
+   │  └─ run-all-dry.ps1           # iterate MMTS_ML_* with --dryrun
+   └─ ci/
+      └─ github-actions.yml
+
+////////////////////////////////////////////////////////////
+MMTS.Shared        -> (none)
+MMTS.ML            -> MMTS.Shared
+MMTS.Hooks         -> MMTS.Shared
+Engine0            -> MMTS.ML, MMTS.Hooks, MMTS.Shared
+Engine1A           -> MMTS.ML, MMTS.Hooks, MMTS.Shared
+Engine1B           -> MMTS.ML, MMTS.Hooks, MMTS.Shared
+MMTS.Tests         -> MMTS.ML, MMTS.Hooks, MMTS.Shared
+
+////////////////////////////////////////////////////////////
+Target frameworks & key packages
+
+All projects target: net8.0 (or net9.0 if you’re ready).
+
+Recommended NuGet:
+
+MMTS.ML: YamlDotNet, System.CommandLine, Microsoft.Data.SqlClient, FSharp.Core, FsCheck (optional), FluentValidation (if you prefer).
+
+MMTS.Shared: Microsoft.Data.SqlClient, Dapper (optional), Serilog (or Microsoft.Extensions.Logging).
+
+Engines: Quartz (if scheduling), Serilog.Sinks.Console.
+
+Tests: xunit, FsUnit.Xunit (optional), coverlet.collector.
+////////////////////////////////////////////////////////////
+Minimal .fsproj examples
+src/MMTS.ML/MMTS.ML.fsproj
+...
+
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <LangVersion>preview</LangVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="src/Types.fs" />
+    <Compile Include="src/Parse.fs" />
+    <Compile Include="src/Materialize.fs" />
+    <Compile Include="src/Exec.fs" />
+    <Compile Include="src/Repl.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="YamlDotNet" Version="15.1.2" />
+    <PackageReference Include="Microsoft.Data.SqlClient" Version="5.2.0" />
+    <PackageReference Include="System.CommandLine" Version="2.0.0-beta4.22272.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\MMTS.Shared\MMTS.Shared.fsproj" />
+  </ItemGroup>
+</Project>
+
+////////////////////////////////////////////////////////////
+src/Engine0/Engine0.fsproj
+...
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Program.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\MMTS.ML\MMTS.ML.fsproj" />
+    <ProjectReference Include="..\MMTS.Hooks\MMTS.Hooks.fsproj" />
+    <ProjectReference Include="..\MMTS.Shared\MMTS.Shared.fsproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="workflows\S0_MMTS_ML.yaml" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="appsettings.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Serilog.Sinks.Console" Version="5.0.1" />
+    <PackageReference Include="Quartz" Version="3.9.0" />
+  </ItemGroup>
+</Project>
+
+////////////////////////////////////////////////////////////
+src/MMTS.Hooks/MMTS.Hooks.fsproj
+...
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="src/Common/HookUtil.fs" />
+    <Compile Include="src/POC/Hooks.S0.Fetch.v1/Module.fs" />
+    <Compile Include="src/POC/Hooks.S0.Transform.v1/Module.fs" />
+    <Compile Include="src/POC/Hooks.S1.Prepare.v1/Module.fs" />
+    <Compile Include="src/POC/Hooks.S2.Transform.v1/Module.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\MMTS.Shared\MMTS.Shared.fsproj" />
+  </ItemGroup>
+</Project>
+
+
+////////////////////////////////////////////////////////////
+Suggested Directory.Build.props (root build/)
+...
+<Project>
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <Deterministic>true</Deterministic>
+    <WarningsNotAsErrors>FS0020;FS0052</WarningsNotAsErrors>
+  </PropertyGroup>
+</Project>
+
+////////////////////////////////////////////////////////////
+(Optionally centralize package versions in Directory.Packages.props.)
+
+Quick scaffold with dotnet CLI
+
+From the repo root:
+
+...
+dotnet new sln -n MMTS
+mkdir -p src/{MMTS.Shared,MMTS.ML,MMTS.Hooks,Engine0,Engine1A,Engine1B,MMTS.Tests}
+
+# Classlibs
+dotnet new classlib -lang "F#" -o src/MMTS.Shared
+dotnet new classlib -lang "F#" -o src/MMTS.ML
+dotnet new classlib -lang "F#" -o src/MMTS.Hooks
+
+# Consoles (engines)
+dotnet new console  -lang "F#" -o src/Engine0
+dotnet new console  -lang "F#" -o src/Engine1A
+dotnet new console  -lang "F#" -o src/Engine1B
+
+# Tests
+dotnet new xunit    -lang "F#" -o src/MMTS.Tests
+
+# Add to solution
+dotnet sln MMTS.sln add src/**/**/*.fsproj
+
+////////////////////////////////////////////////////////////
+Where code “belongs” (recap)
+MMTS.ML → parser, types, exec, validations, materialize, REPL.
+Engine0 / 1A / 1B → thin workers that (a) load a workflow YAML, (b) pass args/env, (c) run via MMTS.ML Exec, (d) optionally schedule with Quartz.
+MMTS.Hooks → reusable hook implementations (or move them into each Engine if you want stricter isolation).
+MMTS.Shared → common domain types, SQL helpers, numerics.
+
+If you want, I can also drop in:
+a minimal Program.fs for Engine0 that supports both batch (--run <yaml>) and REPL passthrough, and
+a skeleton S0_MMTS_ML.yaml wired to POC.Hooks.S0.Fetch.v1.Module & POC.Hooks.S0.Transform.v1.Module.
+Say the word and I’ll slot those in.
+
+////////////////////////////////////////////////////////////
+please. give code to a minimal Program.fs for Engine0 
+that supports both batch (--run <yaml>) and REPL passthrough, and
+
+a skeleton S0_MMTS_ML.yaml wired to POC.Hooks.S0.Fetch.v1.Module & POC.Hooks.S0.Transform.v1.Module.
+////////////////////////////////////////////////////////////
+got it, Ami! here’s a drop-in Engine0/Program.fs and a matching 
+workflows/S0_MMTS_ML.yaml wired to your POC.Hooks.S0.Fetch.v1.Module 
+and POC.Hooks.S0.Transform.v1.Module.
+////////////////////////////////////////////////////////////
+src/Engine0/Program.fs
+..
+
+namespace Engine0
+
+open System
+open System.IO
+open System.Collections.Generic
+
+// References expected:
+// - MMTS.ML (Types, Parse, Exec, Repl)
+// - MMTS.Shared (optional logging/sql helpers)
+
+module Cli =
+    type Mode =
+        | Repl
+        | Run of yamlPath:string * dryRun:bool * overrides:Map<string,string>
+
+    let private trySplitKV (s:string) =
+        let i = s.IndexOf('=')
+        if i > 0 && i < s.Length-1 then
+            let k = s.Substring(0, i).Trim()
+            let v = s.Substring(i+1).Trim()
+            if k <> "" then Some (k, v) else None
+        else None
+
+    /// Naive arg parser:
+    ///   engine0 --run workflows\S0_MMTS_ML.yaml [--dryrun] [--set key=val ...]
+    let parseArgs (argv:string[]) : Mode =
+        if argv |> Array.exists (fun a -> a = "--run") then
+            let mutable yaml = ""
+            let mutable dryRun = false
+            let kvs = Dictionary<string,string>(StringComparer.OrdinalIgnoreCase)
+
+            let rec loop i =
+                if i >= argv.Length then ()
+                else
+                    match argv.[i] with
+                    | "--run" when i+1 < argv.Length ->
+                        yaml <- argv.[i+1]; loop (i+2)
+                    | "--dryrun" ->
+                        dryRun <- true; loop (i+1)
+                    | "--set" when i+1 < argv.Length ->
+                        match trySplitKV argv.[i+1] with
+                        | Some (k,v) -> kvs.[k] <- v
+                        | None -> ()
+                        loop (i+2)
+                    | _ -> loop (i+1)
+            loop 0
+
+            if String.IsNullOrWhiteSpace yaml then Repl
+            else Run(yaml, dryRun, kvs |> Seq.map id |> Map.ofSeq)
+        else
+            Repl
+
+module Program =
+    open Cli
+
+    [<EntryPoint>]
+    let main argv =
+        try
+            match parseArgs argv with
+            | Repl ->
+                // Hand off to the MMTS.ML REPL (passthrough).
+                // Expect Repl.start : unit -> int or similar.
+                printfn "Engine0 → REPL passthrough (MMTS.ML)."
+                printfn "Commands: :load <file>, :list, :params, :set k=v, :hook show/set, :run [all|<step>], :validate [all|<id>] [--stop-on-first-error], :emit, :dryrun emit, :save <file>, :q"
+                // If your Repl.start signature differs, adapt this line accordingly.
+                MMTS.ML.Repl.start()
+
+            | Run(yamlPath, dryRun, overrides) ->
+                if not (File.Exists yamlPath) then
+                    eprintfn "YAML not found: %s" yamlPath
+                    2
+                else
+                    let yamlText = File.ReadAllText yamlPath
+
+                    // 1) Parse YAML → workflow spec
+                    let wf =
+                        match MMTS.ML.Parse.tryParse yamlText with
+                        | Ok spec -> spec
+                        | Error err ->
+                            eprintfn "Parse error: %s" err
+                            return 3
+
+                    // 2) Apply CLI param overrides (e.g., --set env=dev --set batchId=2025-09-15)
+                    let wf' = MMTS.ML.Exec.applyParamOverrides wf overrides
+
+                    // 3) Validate (optional but nice to fail fast)
+                    match MMTS.ML.Exec.validate wf' with
+                    | [] -> () // no errors
+                    | errs ->
+                        eprintfn "Validation failed (%d):" errs.Length
+                        for e in errs do eprintfn " - %s" e
+                        return 4
+
+                    // 4) Dry-run or execute
+                    if dryRun then
+                        printfn "DRYRUN: emitting plan for %s" (Path.GetFileName yamlPath)
+                        MMTS.ML.Exec.emitDryRun wf' |> printfn "%s"
+                        0
+                    else
+                        printfn "RUN: executing %s" (Path.GetFileName yamlPath)
+                        match MMTS.ML.Exec.run wf' with
+                        | Ok summary ->
+                            printfn "OK: %s" summary
+                            0
+                        | Error err ->
+                            eprintfn "EXEC ERROR: %s" err
+                            5
+        with ex ->
+            eprintfn "FATAL: %s" (ex.ToString())
+            1
+
+////////////////////////////////////////////////////////////
+Notes:
+
+Expects these functions in MMTS.ML:
+
+Parse.tryParse : string -> Result<WorkflowSpec,string>
+
+Exec.applyParamOverrides : WorkflowSpec -> Map<string,string> -> WorkflowSpec
+
+Exec.validate : WorkflowSpec -> string list (empty = OK)
+
+Exec.emitDryRun : WorkflowSpec -> string
+
+Exec.run : WorkflowSpec -> Result<string,string>
+
+Repl.start : unit -> int
+
+If your signatures differ, tweak the calls but keep the structure.
+...If you want, I can also stub the two POC hooks 
+(POC.Hooks.S0.Fetch.v1.Module and POC.Hooks.S0.Transform.v1.Module) 
+so this skeleton runs end-to-end with dummy data.
+
+////////////////////////////////////////////////////////////
+perfect — here are drop-in stubs for the two POC hooks 
+so your S0 skeleton runs end-to-end with dummy data. 
+They follow a super-simple “rows in/out” contract using IDictionary<string,obj> rows. 
+I also included a tiny shared HookUtil so Fetch can stash rows 
+and Transform can retrieve them by batchId (matching what you already pass in the YAML).
+
+Files go in your MMTS.Hooks project exactly as shown below.
+////////////////////////////////////////////////////////////
+src/MMTS.Hooks/src/Common/HookUtil.fs
+...
+namespace POC.Hooks.Common
+
+open System
+open System.Collections.Concurrent
+
+/// A tiny in-memory handoff so one hook can pass objects to the next
+/// using a correlation key (e.g., batchId). This is only for POC/local runs.
+/// Production should rely on Exec passing in-memory rows directly,
+/// or a proper channel (stdin/json, temp table, etc.).
+[<AutoOpen>]
+module HookUtil =
+    let private inbox = ConcurrentDictionary<string, obj>()
+
+    /// Store a value under a key (idempotent replace)
+    let stash (key: string) (value: obj) : unit =
+        inbox[key] <- value
+
+    /// Try to retrieve (and remove) a value by key
+    let tryTake (key: string) : obj option =
+        match inbox.TryRemove key with
+        | true, v -> Some v
+        | _ -> None
+
+
+////////////////////////////////////////////////////////////
+src/MMTS.Hooks/src/POC/Hooks.S0.Fetch.v1/Module.fs
+...
+namespace POC.Hooks.S0.Fetch.v1
+
+open System
+open System.Collections.Generic
+open POC.Hooks.Common
+
+module Module =
+
+    // Row helper (IDictionary<string,obj>)
+    type Row = IDictionary<string,obj>
+
+    let private row (pairs: (string * obj) list) : Row =
+        let d = Dictionary<string,obj>(StringComparer.OrdinalIgnoreCase) :> IDictionary<string,obj>
+        for (k,v) in pairs do d.[k] <- v
+        d
+
+    let private tryGet (k: string) (m: IDictionary<string,string>) =
+        match m.TryGetValue k with
+        | true, v -> Some v
+        | _ -> None
+
+    /// Generate a few dummy S0 rows and stash them by batchId
+    /// Parameters (read from args):
+    ///   - dataFeed (default: "EOD5Secs")
+    ///   - batchId  (default: "demo-batch")
+    /// Notes:
+    ///   - Returns obj that is actually ResizeArray<Row> for Exec "rows"
+    [<CompiledName("Run")>]
+    let Run (args: IDictionary<string,string>) : obj =
+        let dataFeed = tryGet "dataFeed" args |> Option.defaultValue "EOD5Secs"
+        let batchId  = tryGet "batchId"  args |> Option.defaultValue "demo-batch"
+
+        // Use a fixed timestamp so materializer gets a deterministic key in POC
+        let dt = DateTime(2025, 01, 17, 15, 00, 00, DateTimeKind.Unspecified)
+
+        let rows = ResizeArray<Row>()
+
+        let add symbol statName raw med mad =
+            rows.Add(
+                row [
+                    "DataFeed",  box dataFeed
+                    "Symbol",    box symbol
+                    "StatName",  box statName
+                    "TradeDate", box dt
+                    "Raw",       box raw
+                    "Med",       box med
+                    "Mad",       box mad
+                ]
+            )
+
+        // Dummy data (two symbols)
+        add "AAPL" "WAP"  123.45 120.00 1.50
+        add "MSFT" "WAP"  234.56 230.00 1.00
+
+        // Make the rows available to the next hook (Transform) using batchId
+        stash batchId (rows :> obj)
+
+        // Also return rows as the hook's output
+        box rows
+
+////////////////////////////////////////////////////////////
+src/MMTS.Hooks/src/POC/Hooks.S0.Transform.v1/Module.fs
+...
+namespace POC.Hooks.S0.Transform.v1
+
+open System
+open System.Collections.Generic
+open POC.Hooks.Common
+
+module Module =
+
+    type Row = IDictionary<string,obj>
+
+    let private row (pairs: (string * obj) list) : Row =
+        let d = Dictionary<string,obj>(StringComparer.OrdinalIgnoreCase) :> IDictionary<string,obj>
+        for (k,v) in pairs do d.[k] <- v
+        d
+
+    let private tryGet (k: string) (m: IDictionary<string,string>) =
+        match m.TryGetValue k with
+        | true, v -> Some v
+        | _ -> None
+
+    let private asString (o: obj) = o :?> string
+    let private asFloat  (o: obj) =
+        match o with
+        | :? float as f -> f
+        | :? double as d -> d |> float
+        | :? decimal as m -> m |> float
+        | :? int as i -> i |> float
+        | _ -> failwithf "Cannot coerce %A to float" o
+
+    let private asDateTime (o: obj) =
+        match o with
+        | :? DateTime as dt -> dt
+        | _ -> failwithf "Cannot coerce %A to DateTime" o
+
+    /// A tiny "transform":
+    ///  - bumps Raw by +1%,
+    ///  - keeps Med/Mad as-is,
+    ///  - preserves identity columns (DataFeed, Symbol, StatName, TradeDate).
+    /// If upstream rows are not found (e.g., running this hook standalone),
+    /// it generates a local dummy set so the pipeline still succeeds.
+    [<CompiledName("Run")>]
+    let Run (args: IDictionary<string,string>) : obj =
+        let batchId = tryGet "batchId" args |> Option.defaultValue "demo-batch"
+
+        // Try to consume the rows stashed by Fetch
+        let inputRowsOpt =
+            tryTake batchId
+            |> Option.bind (fun o ->
+                match o with
+                | :? ResizeArray<Row> as ra -> Some (ra :> seq<Row>)
+                | :? seq<Row> as s -> Some s
+                | _ -> None)
+
+        let inputRows : seq<Row> =
+            match inputRowsOpt with
+            | Some s -> s
+            | None ->
+                // Fallback dummy input (in case Transform is executed alone)
+                let dt = DateTime(2025, 01, 17, 15, 00, 00, DateTimeKind.Unspecified)
+                [
+                    dict [
+                        "DataFeed",  box "EOD5Secs"
+                        "Symbol",    box "AAPL"
+                        "StatName",  box "WAP"
+                        "TradeDate", box dt
+                        "Raw",       box 100.0
+                        "Med",       box  99.0
+                        "Mad",       box   1.0
+                    ] :> Row
+                    dict [
+                        "DataFeed",  box "EOD5Secs"
+                        "Symbol",    box "MSFT"
+                        "StatName",  box "WAP"
+                        "TradeDate", box dt
+                        "Raw",       box 200.0
+                        "Med",       box 198.0
+                        "Mad",       box   1.0
+                    ] :> Row
+                ] :> seq<Row>
+
+        let out = ResizeArray<Row>()
+
+        for r in inputRows do
+            let dataFeed  = r.["DataFeed"]  |> asString
+            let symbol    = r.["Symbol"]    |> asString
+            let statName  = r.["StatName"]  |> asString
+            let tradeDate = r.["TradeDate"] |> asDateTime
+            let raw       = r.["Raw"]       |> asFloat
+            let med       = r.["Med"]       |> asFloat
+            let mad       = r.["Mad"]       |> asFloat
+
+            // Minimal "transform": Raw → Raw * 1.01 (bump 1%)
+            let raw' = raw * 1.01
+
+            out.Add(
+                row [
+                    "DataFeed",  box dataFeed
+                    "Symbol",    box symbol
+                    "StatName",  box statName
+                    "TradeDate", box tradeDate
+                    "Raw",       box raw'
+                    "Med",       box med
+                    "Mad",       box mad
+                ]
+            )
+
+        // Return rows as hook output
+        box out
+
+////////////////////////////////////////////////////////////
+How this wires into your existing YAML
+
+Your S0_MMTS_ML.yaml already sets and passes batchId (default ${NOW:yyyy-MM-dd}).
+
+Fetch.Run generates dummy rows matching the materialize schema and stashes them using that batchId.
+
+Transform.Run retrieves those rows via HookUtil.tryTake, applies a trivial transformation, and returns them to the engine.
+
+Materializer then writes them (or prints the plan in --dryrun).
+////////////////////////////////////////////////////////////
+# Execute end-to-end
+dotnet run --project src/Engine0 -- --run src/Engine0/workflows/S0_MMTS_ML.yaml
+
+# Dry-run (no DB write)
+dotnet run --project src/Engine0 -- --run src/Engine0/workflows/S0_MMTS_ML.yaml --dryrun
+
+# Override the batchId to see the stash/take linkage
+dotnet run --project src/Engine0 -- --run src/Engine0/workflows/S0_MMTS_ML.yaml --set batchId=2025-09-15
+
+////////////////////////////////////////////////////////////
+If you want the transform to strictly consume the pipeline’s in-memory 
+rows provided by your Exec (instead of this stash), we can swap the handoff 
+to whatever channel your Exec exposes (stdin JSON, typed argument, etc.). 
+This stub keeps it simple so you can verify the whole S0 loop today.
+////////////////////////////////////////////////////////////
+can you give code for MMTS.ML.Repl.start()
+...
+
+heck yes—here’s a minimal but comfy REPL you can drop into MMTS.ML as src/Repl.fs.
+It supports the commands you’ve been using:
+
+:load <file>
+
+:save <file>
+
+:params
+
+:set k=v / :unset k
+
+:list (steps & hooks)
+
+:validate [--stop-on-first-error]
+
+:emit (pretty print)
+
+:dryrun emit
+
+:run (whole workflow)
+
+:q (quit)
+
+It expects you already have:
+
+Parse.tryParse : string -> Result<WorkflowSpec,string>
+
+Exec.applyParamOverrides : WorkflowSpec -> Map<string,string> -> WorkflowSpec
+
+Exec.validate : WorkflowSpec -> string list
+
+Exec.emitDryRun : WorkflowSpec -> string
+
+
+////////////////////////////////////////////////////////////
+namespace MMTS.ML
+
+open System
+open System.IO
+open System.Text
+open System.Collections.Generic
+
+module Repl =
+
+    // ---- Domain expectations (from your MMTS.ML) ----
+    // open MMTS.ML.Types
+    // open MMTS.ML.Parse
+    // open MMTS.ML.Exec
+
+    type private State =
+        { LoadedPath : string option
+          Workflow   : obj option  // store as obj to avoid tight type coupling in this snippet
+          Overrides  : Map<string,string>
+          Dirty      : bool }
+        static member Empty =
+            { LoadedPath = None; Workflow = None; Overrides = Map.empty; Dirty = false }
+
+    // Simple console helpers
+    let private info (s:string)  = printfn "%s" s
+    let private warn (s:string)  = eprintfn "%s" s
+    let private error (s:string) = eprintfn "%s" s
+    let private prompt() =
+        if Console.IsOutputRedirected then () else
+        Console.Write("> ")
+
+    // (De)serialization for save/load (save stores the YAML we loaded + current overrides as a header)
+    let private withApplied (wf: obj) (ovr: Map<string,string>) : obj =
+        // Bridge to Exec.applyParamOverrides
+        let wf' =
+            try Exec.applyParamOverrides (wf :?> _) ovr :> obj
+            with _ -> wf
+        wf'
+
+    // Try to summarize a workflow for :list / :params
+    let private tryDescribe (wf: obj) : string =
+        try
+            let sb = StringBuilder()
+            // naive reflection-based summary for minimal coupling
+
+            // name/version
+            let nameProp   = wf.GetType().GetProperty("Name")
+            let verProp    = wf.GetType().GetProperty("Version")
+            let nameStr    = if isNull nameProp then "(unknown)" else string (nameProp.GetValue wf)
+            let verStr     = if isNull verProp then "(unknown)" else string (verProp.GetValue wf)
+            sb.AppendLine($"workflow: {nameStr}  v{verStr}") |> ignore
+
+            // params
+            let paramProp  = wf.GetType().GetProperty("Params")
+            if not (isNull paramProp) then
+                match paramProp.GetValue wf with
+                | :? IDictionary<string,string> as p ->
+                    if p.Count = 0 then sb.AppendLine("params: (none)") |> ignore
+                    else
+                        sb.AppendLine("params:") |> ignore
+                        for kv in p do sb.AppendLine($"  {kv.Key} = {kv.Value}") |> ignore
+                | _ -> ()
+            // steps
+            let stepsProp = wf.GetType().GetProperty("Steps")
+            if not (isNull stepsProp) then
+                match stepsProp.GetValue wf with
+                | :? IEnumerable<obj> as steps ->
+                    let mutable c = 0
+                    for s in steps do c <- c + 1
+                    sb.AppendLine($"steps: {c}") |> ignore
+                | _ -> ()
+            sb.ToString()
+        with _ ->
+            "(uninspectable workflow)"
+
+    let private showParams (wf: obj) =
+        try
+            let paramProp = wf.GetType().GetProperty("Params")
+            match paramProp with
+            | null -> info "no params on workflow"
+            | p ->
+                match p.GetValue wf with
+                | :? IDictionary<string,string> as mm ->
+                    if mm.Count = 0 then info "(no params)"
+                    else
+                        info "params:"
+                        for kv in mm do info $"  {kv.Key} = {kv.Value}"
+                | _ -> info "(params not a dictionary)"
+        with ex ->
+            warn $"cannot read params: {ex.Message}"
+
+    let private showHooks (wf: obj) =
+        try
+            let hooksProp = wf.GetType().GetProperty("Hooks")
+            match hooksProp with
+            | null -> info "no hooks on workflow"
+            | p ->
+                match p.GetValue wf with
+                | :? IDictionary<string,obj> as mm ->
+                    if mm.Count = 0 then info "(no hooks)"
+                    else
+                        info "hooks:"
+                        for kv in mm do
+                            let name = kv.Key
+                            let v = kv.Value
+                            // Expecting fields: Module, Func, Kind (best-effort)
+                            let modP = v.GetType().GetProperty("Module")
+                            let funP = v.GetType().GetProperty("Func")
+                            let kindP= v.GetType().GetProperty("Kind")
+                            let m = if isNull modP then "" else string (modP.GetValue v)
+                            let f = if isNull funP then "" else string (funP.GetValue v)
+                            let k = if isNull kindP then "" else string (kindP.GetValue v)
+                            info $"  {name} → module={m} func={f} kind={k}"
+                | _ -> info "(hooks not a dictionary)"
+        with ex ->
+            warn $"cannot read hooks: {ex.Message}"
+
+    let private loadFromFile (path:string) : Result<obj*string,string> =
+        try
+            if not (File.Exists path) then Error $"file not found: {path}"
+            else
+                let txt = File.ReadAllText path
+                match Parse.tryParse txt with
+                | Ok wf -> Ok (wf :> obj, txt)
+                | Error e -> Error e
+        with ex ->
+            Error ex.Message
+
+    let private saveToFile (path:string) (wf:obj) (ovr:Map<string,string>) =
+        // we only save a dry-run emission so user sees the “resolved picture” plus overrides as a header
+        try
+            let wf' = withApplied wf ovr
+            let rendered = Exec.emitDryRun (wf' :?> _) // string
+            let sb = StringBuilder()
+            sb.AppendLine("# MMTS.ML REPL save")
+              .AppendLine("# overrides:")
+              |> ignore
+            if ovr.IsEmpty then sb.AppendLine("#   (none)") |> ignore
+            else for KeyValue(k,v) in ovr do sb.AppendLine($"#   {k}={v}") |> ignore
+            sb.AppendLine().Append(rendered) |> ignore
+            File.WriteAllText(path, sb.ToString())
+            Ok ()
+        with ex -> Error ex.Message
+
+    let private runValidate (wf:obj) =
+        let errs = Exec.validate (wf :?> _)
+        if errs.IsEmpty then info "validate: OK"
+        else
+            error $"validate: {errs.Length} error(s)"
+            for e in errs do error $"  - {e}"
+
+    let private runEmit (wf:obj) =
+        let s = Exec.emitDryRun (wf :?> _)
+        info s
+
+    let private runAll (wf:obj) =
+        match Exec.run (wf :?> _) with
+        | Ok summary -> info $"OK: {summary}"; 0
+        | Error err  -> error $"EXEC ERROR: {err}"; 1
+
+    let private parseSet (s:string) =
+        let i = s.IndexOf('=')
+        if i > 0 && i < s.Length-1 then
+            let k = s.Substring(0,i).Trim()
+            let v = s.Substring(i+1).Trim()
+            if k<>"" then Some(k,v) else None
+        else None
+
+    let private help() =
+        info "MMTS ML REPL. Commands:"
+        info "  :load <file>                load YAML"
+        info "  :save <file>                save current (dry-run render + overrides header)"
+        info "  :list                       show workflow + hooks summary"
+        info "  :params                     show workflow params"
+        info "  :set k=v                    set/override param k=v (runtime override)"
+        info "  :unset k                    remove runtime override"
+        info "  :validate [--stop-on-first-error]  validate workflow"
+        info "  :emit                       pretty print dry-run execution plan"
+        info "  :dryrun emit                alias of :emit"
+        info "  :run                        execute whole workflow"
+        info "  :q                          quit"
+
+    /// Start the REPL; returns an exit code (0 = normal)
+    let start () : int =
+        let mutable st = State.Empty
+        help()
+        let mutable loop = true
+        while loop do
+            prompt()
+            let line = Console.ReadLine()
+            if isNull line then loop <- false else
+            let cmd = line.Trim()
+            if cmd = "" then ()
+            else
+                let parts = cmd.Split(' ', StringSplitOptions.RemoveEmptyEntries)
+                match parts.[0] with
+                | ":q" ->
+                    loop <- false
+
+                | ":help" | ":h" | "help" ->
+                    help()
+
+                | ":load" when parts.Length >= 2 ->
+                    let path = String.Join(' ', parts |> Seq.skip 1)
+                    match loadFromFile path with
+                    | Ok (wf, _) ->
+                        st <- { st with LoadedPath = Some path; Workflow = Some wf; Dirty = false }
+                        info $"loaded: {path}"
+                        info (tryDescribe wf)
+                    | Error e -> error $"load failed: {e}"
+
+                | ":save" when parts.Length >= 2 ->
+                    match st.Workflow with
+                    | None -> warn "nothing loaded"
+                    | Some wf ->
+                        let path = String.Join(' ', parts |> Seq.skip 1)
+                        match saveToFile path wf st.Overrides with
+                        | Ok () -> info $"saved: {path}"
+                        | Error e -> error $"save failed: {e}"
+
+                | ":list" ->
+                    match st.Workflow with
+                    | None -> warn "nothing loaded"
+                    | Some wf ->
+                        info (tryDescribe wf)
+                        showHooks wf
+
+                | ":params" ->
+                    match st.Workflow with
+                    | None -> warn "nothing loaded"
+                    | Some wf -> showParams wf
+
+                | ":set" when parts.Length >= 2 ->
+                    let rest = String.Join(' ', parts |> Seq.skip 1)
+                    match parseSet rest with
+                    | Some (k,v) ->
+                        st <- { st with Overrides = st.Overrides.Add(k,v); Dirty = true }
+                        info $"override set: {k}={v}"
+                    | None -> warn "usage: :set key=value"
+
+                | ":unset" when parts.Length >= 2 ->
+                    let k = parts.[1]
+                    if st.Overrides.ContainsKey k then
+                        st <- { st with Overrides = st.Overrides.Remove k; Dirty = true }
+                        info $"override removed: {k}"
+                    else warn $"no override named {k}"
+
+                | ":validate" ->
+                    match st.Workflow with
+                    | None -> warn "nothing loaded"
+                    | Some wf ->
+                        let wf' = withApplied wf st.Overrides
+                        runValidate wf'
+
+                | ":emit" ->
+                    match st.Workflow with
+                    | None -> warn "nothing loaded"
+                    | Some wf ->
+                        let wf' = withApplied wf st.Overrides
+                        runEmit wf'
+
+                | ":dryrun" when parts.Length >= 2 && parts.[1] = "emit" ->
+                    match st.Workflow with
+                    | None -> warn "nothing loaded"
+                    | Some wf ->
+                        let wf' = withApplied wf st.Overrides
+                        runEmit wf'
+
+                | ":run" ->
+                    match st.Workflow with
+                    | None -> warn "nothing loaded"
+                    | Some wf ->
+                        let wf' = withApplied wf st.Overrides
+                        let code = runAll wf'
+                        if code <> 0 then () // keep session open, just report error
+
+                | other ->
+                    warn $"unknown command: {other}"
+                    info "type :help for commands"
+
+        0
+
+////////////////////////////////////////////////////////////
+Notes & tweaks you can make later
+
+If you want per-step execution (e.g., :run s0.transform), add an API like Exec.runStep : WorkflowSpec * string -> Result<string,string> and wire a parts.Length >= 2 branch for :run.
+
+:save currently writes a “resolved dry-run” view (plus an override header). If you’d rather re-emit the original YAML, keep the original file text in State when loading and write that out.
+
+The reflection in tryDescribe / showParams / showHooks is intentionally loose so you don’t have to expose internal types here—swap to strongly typed accessors if you prefer.
+
+If you want, I can also give you tiny Parse.tryParse and Exec “no-op” stubs so you can compile this REPL before your real parser/executor are in place.
+////////////////////////////////////////////////////////////
+you got it — here are minimal, compile-ready stubs for the pieces your Repl.fs references. Drop these into MMTS.ML:
+
+src/MMTS.ML/src/Types.fs
+
+src/MMTS.ML/src/Parse.fs
+
+src/MMTS.ML/src/Exec.fs
+
+They’re intentionally lightweight: they parse just enough YAML to load your S0_MMTS_ML.yaml, 
+resolve ${param:...} placeholders, invoke hooks via reflection, pass row data step-to-step, 
+and “materialize” by printing a summary (or fully no-op when --dryrun).
+
+
+////////////////////////////////////////////////////////////
+namespace MMTS.ML
+
+open System
+open System.Collections.Generic
+
+type IoKind =
+    | None
+    | Rows
+    | Json
+
+type StepIO = { io: IoKind }
+
+type StepIn =
+    { from: string option
+      io: IoKind }
+
+type StepOut =
+    { io: IoKind }
+
+type HookSpec =
+    { Module: string
+      Func:   string
+      Kind:   string } // "rows" | "json" | "none"
+
+type StepKind =
+    | Normal
+    | Materialize
+
+type StepSpec =
+    { Id:   string
+      Kind: StepKind
+      Inp:  StepIn
+      Out:  StepOut
+      Args: IDictionary<string,obj> }
+
+type WorkflowSpec =
+    { Name:    string
+      Version: string
+      Params:  IDictionary<string,string>
+      Hooks:   IDictionary<string,HookSpec>
+      Steps:   StepSpec list }
+
+////////////////////////////////////////////////////////////
+src/MMTS.ML/src/Parse.fs
+...
+namespace MMTS.ML
+
+open System
+open System.Collections.Generic
+open YamlDotNet.RepresentationModel
+
+module Parse =
+
+    let private toStr (n: YamlNode) = (n :?> YamlScalarNode).Value
+
+    let private tryGet (m: YamlMappingNode) (key: string) =
+        let k = YamlScalarNode(key) :> YamlNode
+        if m.Children.ContainsKey k then Some m.Children.[k] else None
+
+    let private asMap (n: YamlNode) = n :?> YamlMappingNode
+    let private asSeq (n: YamlNode) = n :?> YamlSequenceNode
+
+    let private ioOf (s:string) =
+        match s.Trim().ToLowerInvariant() with
+        | "rows" -> IoKind.Rows
+        | "json" -> IoKind.Json
+        | _      -> IoKind.None
+
+    let private stepKindOf (s:string option) =
+        match s with
+        | Some k when k.Trim().ToLowerInvariant() = "materialize" -> StepKind.Materialize
+        | _ -> StepKind.Normal
+
+    /// Very small, permissive parser for the subset we use in S0
+    let tryParse (yamlText: string) : Result<WorkflowSpec, string> =
+        try
+            let ys = YamlStream()
+            ys.Load(new System.IO.StringReader(yamlText))
+            let root = ys.Documents.[0].RootNode |> asMap
+
+            let name    = tryGet root "name"    |> Option.map toStr |> Option.defaultValue "(unnamed)"
+            let version = tryGet root "version" |> Option.map toStr |> Option.defaultValue "1.0"
+
+            // params
+            let prms : IDictionary<string,string> = dict [] :> _
+            match tryGet root "params" with
+            | Some p ->
+                let pm = asMap p
+                for kv in pm.Children do
+                    let k = (kv.Key :?> YamlScalarNode).Value
+                    let v =
+                        match kv.Value with
+                        | :? YamlScalarNode as sc -> sc.Value
+                        | _ -> kv.Value.ToString()
+                    (prms :?> Dictionary<string,string>).[k] <- v
+            | None -> ()
+
+            // hooks
+            let hooks : IDictionary<string,HookSpec> = dict [] :> _
+            match tryGet root "hooks" with
+            | Some h ->
+                let hm = asMap h
+                for kv in hm.Children do
+                    let name = (kv.Key :?> YamlScalarNode).Value
+                    let v    = asMap kv.Value
+                    let modl = tryGet v "module" |> Option.map toStr |> Option.defaultValue ""
+                    let func = tryGet v "func"   |> Option.map toStr |> Option.defaultValue "Run"
+                    let kind = tryGet v "kind"   |> Option.map toStr |> Option.defaultValue "none"
+                    (hooks :?> Dictionary<string,HookSpec>).[name] <- { Module = modl; Func = func; Kind = kind }
+            | None -> ()
+
+            // steps
+            let steps =
+                match tryGet root "steps" with
+                | Some s ->
+                    [ for n in asSeq s do
+                        let m = asMap n
+                        let id = tryGet m "id" |> Option.map toStr |> Option.defaultValue ""
+                        let kind =
+                            tryGet m "kind" |> Option.map toStr |> stepKindOf
+
+                        let parseIn() =
+                            let iM =
+                                match tryGet m "in" with
+                                | Some x -> asMap x
+                                | None -> YamlMappingNode()
+                            let from = tryGet iM "from" |> Option.map toStr
+                            let io =
+                                match tryGet iM "io" with
+                                | Some x -> ioOf (toStr x)
+                                | None -> IoKind.None
+                            { from = from; io = io }
+
+                        let parseOut() =
+                            let oM =
+                                match tryGet m "out" with
+                                | Some x -> asMap x
+                                | None -> YamlMappingNode()
+                            let io =
+                                match tryGet oM "io" with
+                                | Some x -> ioOf (toStr x)
+                                | None -> IoKind.None
+                            { io = io }
+
+                        let parseArgs() =
+                            let aM =
+                                match tryGet m "args" with
+                                | Some x -> asMap x
+                                | None -> YamlMappingNode()
+                            let d = Dictionary<string,obj>(StringComparer.OrdinalIgnoreCase) :> IDictionary<string,obj>
+                            for kv in aM.Children do
+                                let k = (kv.Key :?> YamlScalarNode).Value
+                                match kv.Value with
+                                | :? YamlScalarNode as sc -> d.[k] <- box sc.Value
+                                | _ -> d.[k] <- box (kv.Value.ToString())
+                            d
+
+                        { Id = id
+                          Kind = kind
+                          Inp  = parseIn()
+                          Out  = parseOut()
+                          Args = parseArgs() } ]
+                | None -> []
+
+            Ok { Name = name; Version = version; Params = prms; Hooks = hooks; Steps = steps }
+        with ex ->
+            Error ex.Message
+
+////////////////////////////////////////////////////////////
+
+src/MMTS.ML/src/Exec.fs
+...
+
+namespace MMTS.ML
+
+open System
+open System.Collections.Generic
+open System.Reflection
+open System.Text
+
+module Exec =
+
+    // ---------- Parameter overrides ----------
+    let applyParamOverrides (wf: WorkflowSpec) (ovr: Map<string,string>) : WorkflowSpec =
+        let dict' = Dictionary<string,string>(wf.Params, StringComparer.OrdinalIgnoreCase) :> IDictionary<string,string>
+        for KeyValue(k,v) in ovr do
+            (dict' :?> Dictionary<string,string>).[k] <- v
+        { wf with Params = dict' }
+
+    // ---------- Basic validation ----------
+    let validate (wf: WorkflowSpec) : string list =
+        let errs = ResizeArray<string>()
+        if String.IsNullOrWhiteSpace wf.Name then errs.Add "name is required"
+        if wf.Steps.IsEmpty then errs.Add "steps is empty"
+        for s in wf.Steps do
+            if String.IsNullOrWhiteSpace s.Id then errs.Add "step.id is required"
+            match s.Kind, s.Inp.io, s.Out.io with
+            | StepKind.Materialize, _, _ -> () // ok
+            | _, _, _ -> () // minimal checks
+        errs |> List.ofSeq
+
+    // ---------- Interpolation ----------
+    let private str (o: obj) = match o with :? string as s -> s | _ -> string o
+    let private tryParam (wf: WorkflowSpec) (key: string) =
+        match wf.Params.TryGetValue key with
+        | true, v -> Some v
+        | _ -> None
+
+    let private resolveString (wf: WorkflowSpec) (s: string) =
+        // supports ${param:key} only (simple POC)
+        let mutable txt = s
+        let rec loop _ =
+            let i = txt.IndexOf("${param:")
+            if i < 0 then () else
+            let j = txt.IndexOf("}", i+8)
+            if j < 0 then () else
+            let key = txt.Substring(i+8, j - (i+8))
+            let repl =
+                match tryParam wf key with
+                | Some v -> v
+                | None -> ""
+            txt <- txt.Substring(0,i) + repl + txt.Substring(j+1)
+            loop ()
+        loop ()
+        txt
+
+    let private resolveArgs (wf: WorkflowSpec) (args: IDictionary<string,obj>) =
+        let d = Dictionary<string,obj>(StringComparer.OrdinalIgnoreCase) :> IDictionary<string,obj>
+        for kv in args do
+            let v =
+                match kv.Value with
+                | :? string as s -> box (resolveString wf s)
+                | _ -> kv.Value
+            d.[kv.Key] <- v
+        d
+
+    // ---------- Hook invocation ----------
+    let private invokeHook (hook: HookSpec) (args: IDictionary<string,string>) : obj =
+        let asm =
+            // Try to find loaded assembly by root namespace of the module
+            let parts = hook.Module.Split('.')
+            let asmName = parts |> Array.tryHead |> Option.defaultValue hook.Module
+            AppDomain.CurrentDomain.GetAssemblies()
+            |> Array.tryFind (fun a -> a.GetName().Name = asmName)
+            |> Option.defaultWith (fun _ ->
+                // Fallback: search by full type name owner
+                let tAsm =
+                    AppDomain.CurrentDomain.GetAssemblies()
+                    |> Array.tryPick (fun a -> a.GetType(hook.Module) |> Option.ofObj |> Option.map (fun _ -> a))
+                defaultArg tAsm (failwithf "Assembly not found for %s" hook.Module)
+            )
+
+        let t = asm.GetType(hook.Module, throwOnError = true, ignoreCase = false)
+        let mi = t.GetMethod(hook.Func, BindingFlags.Public ||| BindingFlags.Static)
+        if isNull mi then failwithf "Function %s not found on %s" hook.Func hook.Module
+        // Expect signature: Run (IDictionary<string,string>) : obj
+        mi.Invoke(null, [| args |])
+
+    // ---------- Emit (dry plan) ----------
+    let emitDryRun (wf: WorkflowSpec) : string =
+        let sb = StringBuilder()
+        sb.AppendLine($"workflow: {wf.Name} (v{wf.Version})") |> ignore
+        sb.AppendLine("params:") |> ignore
+        if wf.Params.Count = 0 then sb.AppendLine("  (none)") |> ignore
+        else for kv in wf.Params do sb.AppendLine($"  {kv.Key} = {kv.Value}") |> ignore
+        sb.AppendLine("steps:") |> ignore
+        for s in wf.Steps do
+            sb.AppendLine($"  - id: {s.Id}  kind: {match s.Kind with | StepKind.Materialize -> "materialize" | _ -> "normal"}  in:{s.Inp.io} out:{s.Out.io}") |> ignore
+            if s.Args.Count > 0 then
+                let r = resolveArgs wf s.Args
+                for kv in r do sb.AppendLine($"      arg {kv.Key} = {kv.Value}") |> ignore
+        sb.ToString()
+
+    // ---------- Runner ----------
+    type ExecContext() =
+        let store = Dictionary<string, obj>(StringComparer.OrdinalIgnoreCase)
+        member _.TryGet (k:string) = match store.TryGetValue k with | true, v -> Some v | _ -> None
+        member _.Set (k:string, v:obj) = store.[k] <- v
+        member _.Count with get() = store.Count
+
+    let run (wf: WorkflowSpec) : Result<string,string> =
+        try
+            let ctx = ExecContext()
+
+            for step in wf.Steps do
+                match step.Kind with
+                | StepKind.Normal ->
+                    // Expect a hook with the same name as step.id
+                    match wf.Hooks.TryGetValue step.Id with
+                    | true, hook ->
+                        // Combine args: resolved + add-through of upstream rows if any
+                        let resolved = resolveArgs wf step.Args
+                        let argStr = Dictionary<string,string>(StringComparer.OrdinalIgnoreCase) :> IDictionary<string,string>
+                        for kv in resolved do
+                            match kv.Value with
+                            | :? string as s -> argStr.[kv.Key] <- s
+                            | _ -> argStr.[kv.Key] <- kv.Value.ToString()
+
+                        // If there is an upstream producer, we’ll also keep the returned obj in context
+                        let rv = invokeHook hook argStr
+                        ctx.Set(step.Id, rv)
+                    | _ ->
+                        // no hook: pass-through if input exists
+                        match step.Inp.from with
+                        | Some src ->
+                            match ctx.TryGet src with
+                            | Some v -> ctx.Set(step.Id, v)
+                            | None -> ctx.Set(step.Id, null)
+                        | None -> ctx.Set(step.Id, null)
+
+                | StepKind.Materialize ->
+                    // Pull rows from the declared 'from'
+                    let fromId =
+                        match step.Inp.from with
+                        | Some f -> f
+                        | None -> failwithf "materialize step '%s' missing 'in.from'" step.Id
+
+                    let payload =
+                        match ctx.TryGet fromId with
+                        | Some v -> v
+                        | None -> null
+
+                    // Minimal “materialize”: count rows if it looks like rows
+                    let rowsCount =
+                        match payload with
+                        | null -> 0
+                        | :? System.Collections.IEnumerable as en ->
+                            en |> Seq.cast<obj> |> Seq.length
+                        | _ -> 1 // some non-enumerable payload
+
+                    // Print a tiny summary (replace with actual bulk_upsert later)
+                    let args = resolveArgs wf step.Args
+                    let target =
+                        match args.TryGetValue "db" with
+                        | true, v -> v.ToString()
+                        | _ ->
+                            match args.TryGetValue "target" with
+                            | true, v -> v.ToString()
+                            | _ -> "(unknown target)"
+
+                    printfn "Materialize: step=%s rows=%d target=%s" step.Id rowsCount target
+
+            Ok (sprintf "Executed %d step(s). Artifacts=%d" wf.Steps.Length (ctx.Count))
+        with ex ->
+            Error ex.Message
+
+////////////////////////////////////////////////////////////
+What you can do next
+
+Swap the “materialize” block for your real bulk-upsert (and use the pre_sql/post_sql args you already modeled).
+
+Expand resolveString to handle ${ENV:...} and ${NOW:...} if you want parity with your YAML examples (easy add).
+
+Add Exec.runStep later if you want :run <stepId> in the REPL.
+
+If you want, I can extend the interpolation now to include ${ENV:NAME|default} and ${NOW:format} 
+to match your earlier YAML—just say the word and I’ll wire it in.
+
+////////////////////////////////////////////////////////////
+ah yes — that error is from trying to put a match expression directly inside an interpolated string.
+F# string interpolation doesn’t allow complex expressions inline.
+
+👉 fix: compute the value in a let first, then interpolate the simple identifier.
+...
+fix for your Exec.emitDryRun
+
+replace this line:
+...
+sb.AppendLine($"  - id: {s.Id}  kind: {match s.Kind with | StepKind.Materialize -> "materialize" | _ -> "normal"} in:{s.Inp.io} out:{s.Out.io}") |> ignore
+
+...
+with....
+let kindStr =
+    match s.Kind with
+    | StepKind.Materialize -> "materialize"
+    | _ -> "normal"
+
+sb.AppendLine($"  - id: {s.Id}  kind: {kindStr}  in:{s.Inp.io} out:{s.Out.io}") |> ignore
+
+
+
+
+////////////////////////////////////////////////////////////
+Good catches—both are classic F# gotchas. Here’s a fixed, drop-in Program.fs for Engine0 that addresses:
+
+Converting Dictionary<string,string> → Map<string,string>
+
+Using return in a non-CE — refactored to just return an int from each branch.
+
+
+////////////////////////////////////////////////////////////
+src/Engine0/Program.fs (patched)
+namespace Engine0
+
+open System
+open System.IO
+open System.Collections.Generic
+
+module Cli =
+    type Mode =
+        | Repl
+        | Run of yamlPath:string * dryRun:bool * overrides:Map<string,string>
+
+    let private trySplitKV (s:string) =
+        let i = s.IndexOf('=')
+        if i > 0 && i < s.Length-1 then
+            let k = s.Substring(0, i).Trim()
+            let v = s.Substring(i+1).Trim()
+            if k <> "" then Some (k, v) else None
+        else None
+
+    /// Usage:
+    ///   engine0 --run workflows\S0_MMTS_ML.yaml [--dryrun] [--set key=val ...]
+    let parseArgs (argv:string[]) : Mode =
+        if argv |> Array.exists (fun a -> a = "--run") then
+            let mutable yaml = ""
+            let mutable dryRun = false
+            let kvs = Dictionary<string,string>(StringComparer.OrdinalIgnoreCase)
+
+            let rec loop i =
+                if i >= argv.Length then () else
+                match argv.[i] with
+                | "--run" when i+1 < argv.Length ->
+                    yaml <- argv.[i+1]; loop (i+2)
+                | "--dryrun" ->
+                    dryRun <- true; loop (i+1)
+                | "--set" when i+1 < argv.Length ->
+                    match trySplitKV argv.[i+1] with
+                    | Some (k,v) -> kvs.[k] <- v
+                    | None -> ()
+                    loop (i+2)
+                | _ ->
+                    loop (i+1)
+            loop 0
+
+            if String.IsNullOrWhiteSpace yaml then Repl
+            else
+                // FIX: convert Dictionary -> Map properly
+                let overrides =
+                    kvs
+                    |> Seq.map (fun (KeyValue(k,v)) -> k, v)
+                    |> Map.ofSeq
+                Run(yaml, dryRun, overrides)
+        else
+            Repl
+
+module Program =
+    open Cli
+
+    [<EntryPoint>]
+    let main argv =
+        try
+            match parseArgs argv with
+            | Repl ->
+                printfn "Engine0 → REPL passthrough (MMTS.ML)."
+                printfn "Commands: :load <file>, :list, :params, :set k=v, :hook show/set, :run [all|<step>], :validate [--stop-on-first-error], :emit, :dryrun emit, :save <file>, :q"
+                MMTS.ML.Repl.start()
+
+            | Run(yamlPath, dryRun, overrides) ->
+                if not (File.Exists yamlPath) then
+                    eprintfn "YAML not found: %s" yamlPath
+                    2
+                else
+                    let yamlText = File.ReadAllText yamlPath
+                    match MMTS.ML.Parse.tryParse yamlText with
+                    | Error err ->
+                        // FIX: don’t use `return` in a non-CE
+                        eprintfn "Parse error: %s" err
+                        3
+                    | Ok spec ->
+                        // Apply CLI overrides
+                        let wf' = MMTS.ML.Exec.applyParamOverrides spec overrides
+
+                        // Validate first
+                        let errs = MMTS.ML.Exec.validate wf'
+                        if not errs.IsEmpty then
+                            eprintfn "Validation failed (%d):" errs.Length
+                            errs |> List.iter (fun e -> eprintfn " - %s" e)
+                            4
+                        else
+                            if dryRun then
+                                printfn "DRYRUN: emitting plan for %s" (Path.GetFileName yamlPath)
+                                MMTS.ML.Exec.emitDryRun wf' |> printfn "%s"
+                                0
+                            else
+                                printfn "RUN: executing %s" (Path.GetFileName yamlPath)
+                                match MMTS.ML.Exec.run wf' with
+                                | Ok summary ->
+                                    printfn "OK: %s" summary
+                                    0
+                                | Error err ->
+                                    eprintfn "EXEC ERROR: %s" err
+                                    5
+        with ex ->
+            eprintfn "FATAL: %s" (ex.ToString())
+            1
+
+////////////////////////////////////////////////////////////
+What changed?
+
+kvs |> Seq.map id |> Map.ofSeq → kvs |> Seq.map (fun (KeyValue(k,v)) -> k, v) |> Map.ofSeq
+
+Removed illegal return usage and restructured the match to return plain int codes from each branch.
+
+If anything else throws type errors, paste the message and the line—happy to patch fast.
+////////////////////////////////////////////////////////////
+to complete Engine0...please do next to ...
+
+Swap the “materialize” block for your real bulk-upsert (and use the pre_sql/post_sql args you already modeled).
+
+Expand resolveString to handle ${ENV:...} and ${NOW:...} if you want parity with your YAML examples (easy add).
+
+Add Exec.runStep later if you want :run <stepId> in the REPL.
+
+ extend the interpolation now to include ${ENV:NAME|default} and ${NOW:format} to match earlier YAML—please wire it in.
+
+////////////////////////////////////////////////////////////
+awesome—here’s a focused upgrade that gets Engine0 “real”:
+
+real bulk-upsert in Exec.run’s materialize step (SqlBulkCopy → MERGE)
+
+richer interpolation for ${ENV:NAME|default} and ${NOW:format}
+
+flattened YAML args in Parse.fs so nested maps like db: { schema:, target: } resolve to keys db.schema / db.target
+
+optional list handling for keys: [...]
+
+a simple Exec.runStep that runs steps up to a given stepId
+
+Assumes you already added Microsoft.Data.SqlClient to MMTS.ML (as you listed earlier).
+
+////////////////////////////////////////////////////////////
+src/MMTS.ML/src/Parse.fs (drop-in replacement)
+...
+namespace MMTS.ML
+
+open System
+open System.Collections.Generic
+open YamlDotNet.RepresentationModel
+
+module Parse =
+
+    let private toStr (n: YamlNode) = (n :?> YamlScalarNode).Value
+
+    let private tryGet (m: YamlMappingNode) (key: string) =
+        let k = YamlScalarNode(key) :> YamlNode
+        if m.Children.ContainsKey k then Some m.Children.[k] else None
+
+    let private asMap (n: YamlNode) = n :?> YamlMappingNode
+    let private asSeq (n: YamlNode) = n :?> YamlSequenceNode
+
+    let private ioOf (s:string) =
+        match s.Trim().ToLowerInvariant() with
+        | "rows" -> IoKind.Rows
+        | "json" -> IoKind.Json
+        | _      -> IoKind.None
+
+    let private stepKindOf (s:string option) =
+        match s with
+        | Some k when k.Trim().ToLowerInvariant() = "materialize" -> StepKind.Materialize
+        | _ -> StepKind.Normal
+
+    /// Flatten a YAML mapping node into "prefix.child" keys
+    let rec private flattenMap (prefix:string) (m: YamlMappingNode) (dest: IDictionary<string,obj>) =
+        for kv in m.Children do
+            let key = (kv.Key :?> YamlScalarNode).Value
+            let fullKey = if String.IsNullOrEmpty prefix then key else $"{prefix}.{key}"
+            match kv.Value with
+            | :? YamlScalarNode as sc ->
+                dest.[fullKey] <- box sc.Value
+            | :? YamlMappingNode as mm ->
+                flattenMap fullKey mm dest
+            | :? YamlSequenceNode as sq ->
+                let arr = ResizeArray<string>()
+                for item in sq.Children do
+                    match item with
+                    | :? YamlScalarNode as isc -> arr.Add(isc.Value)
+                    | _ -> arr.Add(item.ToString())
+                dest.[fullKey] <- box arr
+            | other ->
+                dest.[fullKey] <- box (other.ToString())
+
+    /// Very small, permissive parser for the subset we use in S0
+    let tryParse (yamlText: string) : Result<WorkflowSpec, string> =
+        try
+            let ys = YamlStream()
+            ys.Load(new System.IO.StringReader(yamlText))
+            let root = ys.Documents.[0].RootNode |> asMap
+
+            let name    = tryGet root "name"    |> Option.map toStr |> Option.defaultValue "(unnamed)"
+            let version = tryGet root "version" |> Option.map toStr |> Option.defaultValue "1.0"
+
+            // params
+            let prms : IDictionary<string,string> = Dictionary<string,string>(StringComparer.OrdinalIgnoreCase) :> _
+            match tryGet root "params" with
+            | Some p ->
+                let pm = asMap p
+                for kv in pm.Children do
+                    let k = (kv.Key :?> YamlScalarNode).Value
+                    let v =
+                        match kv.Value with
+                        | :? YamlScalarNode as sc -> sc.Value
+                        | _ -> kv.Value.ToString()
+                    (prms :?> Dictionary<string,string>).[k] <- v
+            | None -> ()
+
+            // hooks
+            let hooks : IDictionary<string,HookSpec> = Dictionary<string,HookSpec>(StringComparer.OrdinalIgnoreCase) :> _
+            match tryGet root "hooks" with
+            | Some h ->
+                let hm = asMap h
+                for kv in hm.Children do
+                    let name = (kv.Key :?> YamlScalarNode).Value
+                    let v    = asMap kv.Value
+                    let modl = tryGet v "module" |> Option.map toStr |> Option.defaultValue ""
+                    let func = tryGet v "func"   |> Option.map toStr |> Option.defaultValue "Run"
+                    let kind = tryGet v "kind"   |> Option.map toStr |> Option.defaultValue "none"
+                    (hooks :?> Dictionary<string,HookSpec>).[name] <- { Module = modl; Func = func; Kind = kind }
+            | None -> ()
+
+            // steps
+            let steps =
+                match tryGet root "steps" with
+                | Some s ->
+                    [ for n in asSeq s do
+                        let m = asMap n
+                        let id = tryGet m "id" |> Option.map toStr |> Option.defaultValue ""
+                        let kind = tryGet m "kind" |> Option.map toStr |> stepKindOf
+
+                        let parseIn() =
+                            let iM =
+                                match tryGet m "in" with
+                                | Some x -> asMap x
+                                | None -> YamlMappingNode()
+                            let from = tryGet iM "from" |> Option.map toStr
+                            let io =
+                                match tryGet iM "io" with
+                                | Some x -> ioOf (toStr x)
+                                | None -> IoKind.None
+                            { from = from; io = io }
+
+                        let parseOut() =
+                            let oM =
+                                match tryGet m "out" with
+                                | Some x -> asMap x
+                                | None -> YamlMappingNode()
+                            let io =
+                                match tryGet oM "io" with
+                                | Some x -> ioOf (toStr x)
+                                | None -> IoKind.None
+                            { io = io }
+
+                        let parseArgs() =
+                            let aM =
+                                match tryGet m "args" with
+                                | Some x -> asMap x
+                                | None -> YamlMappingNode()
+                            let d = Dictionary<string,obj>(StringComparer.OrdinalIgnoreCase) :> IDictionary<string,obj>
+                            // direct scalars + flatten nested maps + capture sequences
+                            for kv in aM.Children do
+                                match kv.Value with
+                                | :? YamlScalarNode as sc ->
+                                    d.[(kv.Key :?> YamlScalarNode).Value] <- box sc.Value
+                                | :? YamlMappingNode as mm ->
+                                    flattenMap ((kv.Key :?> YamlScalarNode).Value) mm d
+                                | :? YamlSequenceNode as sq ->
+                                    let arr = ResizeArray<string>()
+                                    for item in sq.Children do
+                                        match item with
+                                        | :? YamlScalarNode as isc -> arr.Add(isc.Value)
+                                        | _ -> arr.Add(item.ToString())
+                                    d.[(kv.Key :?> YamlScalarNode).Value] <- box arr
+                                | other ->
+                                    d.[(kv.Key :?> YamlScalarNode).Value] <- box (other.ToString())
+                            d
+
+                        { Id = id
+                          Kind = kind
+                          Inp  = parseIn()
+                          Out  = parseOut()
+                          Args = parseArgs() } ]
+                | None -> []
+
+            Ok { Name = name; Version = version; Params = prms; Hooks = hooks; Steps = steps }
+        with ex ->
+            Error ex.Message
+
+////////////////////////////////////////////////////////////
+src/MMTS.ML/src/Exec.fs (drop-in replacement)
+...
+namespace MMTS.ML
+
+open System
+open System.Collections.Generic
+open System.Data
+open System.Reflection
+open System.Text
+open Microsoft.Data.SqlClient
+
+module Exec =
+
+    // ---------- Parameter overrides ----------
+    let applyParamOverrides (wf: WorkflowSpec) (ovr: Map<string,string>) : WorkflowSpec =
+        let dict' = Dictionary<string,string>(wf.Params, StringComparer.OrdinalIgnoreCase) :> IDictionary<string,string>
+        for KeyValue(k,v) in ovr do
+            (dict' :?> Dictionary<string,string>).[k] <- v
+        { wf with Params = dict' }
+
+    // ---------- Basic validation ----------
+    let validate (wf: WorkflowSpec) : string list =
+        let errs = ResizeArray<string>()
+        if String.IsNullOrWhiteSpace wf.Name then errs.Add "name is required"
+        if wf.Steps.IsEmpty then errs.Add "steps is empty"
+        for s in wf.Steps do
+            if String.IsNullOrWhiteSpace s.Id then errs.Add "step.id is required"
+            match s.Kind with
+            | StepKind.Materialize ->
+                // minimal checks for materialize
+                if s.Inp.from.IsNone then errs.Add $"materialize step '{s.Id}' missing in.from"
+            | _ -> ()
+        errs |> List.ofSeq
+
+    // ---------- Interpolation ----------
+    let private tryParam (wf: WorkflowSpec) (key: string) =
+        match wf.Params.TryGetValue key with
+        | true, v -> Some v
+        | _ -> None
+
+    let private replaceAll (s:string, oldValue:string, newValue:string) =
+        if String.IsNullOrEmpty s then s else s.Replace(oldValue, newValue)
+
+    /// ${param:key} | ${ENV:NAME|default} | ${NOW:format}
+    let private resolveString (wf: WorkflowSpec) (s: string) =
+        if String.IsNullOrEmpty s then s else
+        let mutable txt = s
+
+        // param
+        let rec subParam () =
+            let i = txt.IndexOf("${param:")
+            if i < 0 then () else
+            let j = txt.IndexOf("}", i+8)
+            if j < 0 then () else
+            let key = txt.Substring(i+8, j-(i+8))
+            let repl = defaultArg (tryParam wf key) ""
+            txt <- txt.Substring(0,i) + repl + txt.Substring(j+1)
+            subParam ()
+        subParam ()
+
+        // ENV
+        let rec subEnv () =
+            let i = txt.IndexOf("${ENV:")
+            if i < 0 then () else
+            let j = txt.IndexOf("}", i+6)
+            if j < 0 then () else
+            let body = txt.Substring(i+6, j-(i+6)) // NAME|default?
+            let name, def =
+                match body.Split('|') with
+                | [|nm; df|] -> nm, Some df
+                | [|nm|]     -> nm, None
+                | _          -> body, None
+            let valOpt = Environment.GetEnvironmentVariable(name)
+            let repl =
+                if String.IsNullOrEmpty valOpt then defaultArg def "" else valOpt
+            txt <- txt.Substring(0,i) + repl + txt.Substring(j+1)
+            subEnv ()
+        subEnv ()
+
+        // NOW
+        let rec subNow () =
+            let i = txt.IndexOf("${NOW:")
+            if i < 0 then () else
+            let j = txt.IndexOf("}", i+6)
+            if j < 0 then () else
+            let fmt = txt.Substring(i+6, j-(i+6))
+            let repl =
+                try DateTime.Now.ToString(fmt)
+                with _ -> DateTime.Now.ToString("yyyy-MM-dd")
+            txt <- txt.Substring(0,i) + repl + txt.Substring(j+1)
+            subNow ()
+        subNow ()
+
+        txt
+
+    let private resolveArgs (wf: WorkflowSpec) (args: IDictionary<string,obj>) =
+        let d = Dictionary<string,obj>(StringComparer.OrdinalIgnoreCase) :> IDictionary<string,obj>
+        for kv in args do
+            let v =
+                match kv.Value with
+                | :? string as s -> box (resolveString wf s)
+                | :? ResizeArray<string> as arr ->
+                    // interpolate each element
+                    arr |> Seq.map (resolveString wf) |> ResizeArray |> box
+                | other -> other
+            d.[kv.Key] <- v
+        d
+
+    // ---------- Hook invocation ----------
+    let private invokeHook (hook: HookSpec) (args: IDictionary<string,string>) : obj =
+        let asm =
+            // Try to find loaded assembly by root namespace of the module
+            let parts = hook.Module.Split('.')
+            let asmName = parts |> Array.tryHead |> Option.defaultValue hook.Module
+            AppDomain.CurrentDomain.GetAssemblies()
+            |> Array.tryFind (fun a -> a.GetName().Name = asmName)
+            |> Option.defaultWith (fun _ ->
+                // Fallback: search by full type name owner
+                let tAsm =
+                    AppDomain.CurrentDomain.GetAssemblies()
+                    |> Array.tryPick (fun a -> a.GetType(hook.Module) |> Option.ofObj |> Option.map (fun _ -> a))
+                defaultArg tAsm (failwithf "Assembly not found for %s" hook.Module)
+            )
+
+        let t = asm.GetType(hook.Module, throwOnError = true, ignoreCase = false)
+        let mi = t.GetMethod(hook.Func, BindingFlags.Public ||| BindingFlags.Static)
+        if isNull mi then failwithf "Function %s not found on %s" hook.Func hook.Module
+        // Expect signature: Run (IDictionary<string,string>) : obj
+        mi.Invoke(null, [| args |])
+
+    // ---------- Emit (dry plan) ----------
+    let emitDryRun (wf: WorkflowSpec) : string =
+        let sb = StringBuilder()
+        sb.AppendLine($"workflow: {wf.Name} (v{wf.Version})") |> ignore
+        sb.AppendLine("params:") |> ignore
+        if wf.Params.Count = 0 then sb.AppendLine("  (none)") |> ignore
+        else for kv in wf.Params do sb.AppendLine($"  {kv.Key} = {kv.Value}") |> ignore
+        sb.AppendLine("steps:") |> ignore
+        for s in wf.Steps do
+            let kindStr = match s.Kind with | StepKind.Materialize -> "materialize" | _ -> "normal"
+            sb.AppendLine($"  - id: {s.Id}  kind: {kindStr}  in:{s.Inp.io} out:{s.Out.io}") |> ignore
+            if s.Args.Count > 0 then
+                let r = resolveArgs wf s.Args
+                for kv in r do
+                    match kv.Value with
+                    | :? ResizeArray<string> as arr ->
+                        sb.AppendLine($"      arg {kv.Key} = [{String.Join(", ", arr)}]") |> ignore
+                    | _ ->
+                        sb.AppendLine($"      arg {kv.Key} = {kv.Value}") |> ignore
+        sb.ToString()
+
+    // ---------- SQL helpers for materialize ----------
+    let private inferSqlType (v: obj) =
+        match v with
+        | :? string -> "NVARCHAR(4000)"
+        | :? DateTime -> "DATETIME2"
+        | :? int | :? int64 | :? int16 -> "BIGINT"
+        | :? single | :? float | :? double | :? decimal -> "FLOAT"
+        | :? bool -> "BIT"
+        | null -> "NVARCHAR(4000)"
+        | _ -> "NVARCHAR(4000)"
+
+    let private toDataTable (rows: seq<IDictionary<string,obj>>) =
+        let dt = new Data.DataTable("mmts_tmp")
+        // establish columns from first row
+        let first =
+            rows |> Seq.tryHead
+            |> Option.defaultWith (fun _ -> failwith "materialize: no rows to write")
+        for kv in first do
+            // use object type for flexibility; SQL types resolved later
+            dt.Columns.Add(kv.Key, typeof<obj>) |> ignore
+        for r in rows do
+            let values = [| for kv in first -> if r.ContainsKey kv.Key then r.[kv.Key] else null |]
+            dt.Rows.Add(values) |> ignore
+        dt
+
+    let private execNonQuery (conn: SqlConnection) (sql: string) =
+        if String.IsNullOrWhiteSpace sql then 0 else
+        use cmd = new SqlCommand(sql, conn)
+        cmd.CommandTimeout <- 120
+        cmd.ExecuteNonQuery()
+
+    let private bulkUpsert
+        (connStr: string)
+        (schema: string)
+        (target: string)
+        (keys: string list)
+        (rows: seq<IDictionary<string,obj>>)
+        (preSql: string option)
+        (postSql: string option)
+        =
+        use conn = new SqlConnection(connStr)
+        conn.Open()
+
+        preSql |> Option.iter (fun s -> execNonQuery conn s |> ignore)
+
+        let dt = toDataTable rows
+        let temp = $"#mmts_tmp_{Guid.NewGuid().ToString("N")}"
+
+        // create temp table with loose types
+        let cols = [ for c in dt.Columns do let dc = c :?> Data.DataColumn in dc.ColumnName, "NVARCHAR(4000)" ]
+        let createCols = cols |> List.map (fun (n,t) -> $"[{n}] {t} NULL") |> String.Join(", ")
+        let createTmp = $"CREATE TABLE {temp} ({createCols});"
+        execNonQuery conn createTmp |> ignore
+
+        // bulk copy as NVARCHAR (we're sending as obj→ToString when needed)
+        use bc = new SqlBulkCopy(conn)
+        bc.DestinationTableName <- temp
+        for c in dt.Columns do
+            let dc = c :?> Data.DataColumn
+            bc.ColumnMappings.Add(dc.ColumnName, dc.ColumnName) |> ignore
+        bc.WriteToServer(dt)
+
+        // build MERGE
+        let tgt = $"[{schema}].[{target}]"
+        let allCols = dt.Columns |> Seq.cast<Data.DataColumn> |> Seq.map (fun c -> c.ColumnName) |> Seq.toList
+        let onCond =
+            keys
+            |> List.map (fun k -> $"T.[{k}] = S.[{k}]")
+            |> String.concat " AND "
+
+        let upCols =
+            allCols |> List.filter (fun c -> not (keys |> List.exists ((=) c)))
+        let setClause =
+            if upCols.IsEmpty then ""
+            else
+                upCols |> List.map (fun c -> $"T.[{c}] = S.[{c}]") |> String.concat ", " |> sprintf "WHEN MATCHED THEN UPDATE SET %s"
+
+        let insCols = allCols |> List.map (fun c -> $"[{c}]") |> String.concat ", "
+        let insVals = allCols |> List.map (fun c -> $"S.[{c}]") |> String.concat ", "
+
+        let mergeSql = $"""
+MERGE {tgt} AS T
+USING {temp} AS S
+ON {onCond}
+{setClause}
+WHEN NOT MATCHED BY TARGET THEN
+    INSERT ({insCols}) VALUES ({insVals});
+"""
+
+        execNonQuery conn mergeSql |> ignore
+
+        // drop temp
+        execNonQuery conn $"DROP TABLE {temp};" |> ignore
+
+        postSql |> Option.iter (fun s -> execNonQuery conn s |> ignore)
+
+        ()
+
+    // ---------- Runner ----------
+    type ExecContext() =
+        let store = Dictionary<string, obj>(StringComparer.OrdinalIgnoreCase)
+        member _.TryGet (k:string) = match store.TryGetValue k with | true, v -> Some v | _ -> None
+        member _.Set (k:string, v:obj) = store.[k] <- v
+        member _.Count with get() = store.Count
+
+    let private coerceRows (payload: obj) : seq<IDictionary<string,obj>> =
+        match payload with
+        | null -> Seq.empty
+        | :? System.Collections.IEnumerable as en ->
+            en
+            |> Seq.cast<obj>
+            |> Seq.choose (fun o ->
+                match o with
+                | :? IDictionary<string,obj> as d -> Some d
+                | _ -> None)
+        | _ -> Seq.empty
+
+    let run (wf: WorkflowSpec) : Result<string,string> =
+        try
+            let ctx = ExecContext()
+
+            for step in wf.Steps do
+                match step.Kind with
+                | StepKind.Normal ->
+                    match wf.Hooks.TryGetValue step.Id with
+                    | true, hook ->
+                        let resolved = resolveArgs wf step.Args
+                        let argStr = Dictionary<string,string>(StringComparer.OrdinalIgnoreCase) :> IDictionary<string,string>
+                        for kv in resolved do
+                            match kv.Value with
+                            | :? string as s -> argStr.[kv.Key] <- s
+                            | :? ResizeArray<string> as arr -> argStr.[kv.Key] <- String.Join(",", arr)
+                            | v -> argStr.[kv.Key] <- v.ToString()
+                        let rv = invokeHook hook argStr
+                        ctx.Set(step.Id, rv)
+                    | _ ->
+                        // pass-through from upstream, if any
+                        match step.Inp.from with
+                        | Some src ->
+                            match ctx.TryGet src with
+                            | Some v -> ctx.Set(step.Id, v)
+                            | None -> ctx.Set(step.Id, null)
+                        | None -> ctx.Set(step.Id, null)
+
+                | StepKind.Materialize ->
+                    let fromId =
+                        match step.Inp.from with
+                        | Some f -> f
+                        | None -> failwithf "materialize step '%s' missing 'in.from'" step.Id
+
+                    let payload =
+                        match ctx.TryGet fromId with
+                        | Some v -> v
+                        | None -> null
+
+                    let rows = coerceRows payload
+
+                    // Resolve args
+                    let args = resolveArgs wf step.Args
+                    let getStr name =
+                        match args.TryGetValue name with
+                        | true, (:? string as s) -> Some s
+                        | true, v when not (isNull v) -> Some (v.ToString())
+                        | _ -> None
+
+                    let connStr = getStr "connStr" |> Option.defaultWith (fun _ -> failwith "materialize: connStr missing")
+                    let schema  = getStr "db.schema" |> Option.orElse (getStr "schema") |> Option.defaultValue "dbo"
+                    let target  = getStr "db.target" |> Option.orElse (getStr "target_table") |> Option.defaultValue "(unknown)"
+                    // keys can be list or comma
+                    let keys =
+                        match args.TryGetValue "keys" with
+                        | true, (:? ResizeArray<string> as arr) -> arr |> Seq.toList
+                        | true, (:? string as s) when s.Contains(",") -> s.Split(',', StringSplitOptions.RemoveEmptyEntries) |> Array.map (fun x -> x.Trim()) |> Array.toList
+                        | true, (:? string as s) when s <> "" -> [s]
+                        | _ -> []
+
+                    let preSql =
+                        getStr "pre_sql" |> Option.filter (fun s -> not (String.IsNullOrWhiteSpace s))
+                    let postSql =
+                        getStr "post_sql" |> Option.filter (fun s -> not (String.IsNullOrWhiteSpace s))
+
+                    let rowsCount = rows |> Seq.length
+                    if rowsCount = 0 then
+                        printfn "Materialize: step=%s rows=0 target=%s.%s (SKIPPED)" step.Id schema target
+                    else
+                        bulkUpsert connStr schema target keys rows preSql postSql
+                        printfn "Materialize: step=%s rows=%d target=%s.%s (UPSERTED)" step.Id rowsCount schema target
+
+            Ok (sprintf "Executed %d step(s). Artifacts=%d" wf.Steps.Length (ctx.Count))
+        with ex ->
+            Error ex.Message
+
+    /// Optional: run up to (and including) a given stepId
+    let runStep (wf: WorkflowSpec) (stepId: string) : Result<string,string> =
+        let idx = wf.Steps |> List.tryFindIndex (fun s -> s.Id = stepId)
+        match idx with
+        | None -> Error (sprintf "step '%s' not found" stepId)
+        | Some i ->
+            let sub = { wf with Steps = wf.Steps |> List.take (i+1) }
+            run sub
+
+////////////////////////////////////////////////////////////
+args:
+  connStr: "${ENV:MMTS_TEST_CONNSTR|Server=.;Database=0_CADENCE;Trusted_Connection=True;Encrypt=False}"
+  db:
+    schema: "dbo"
+    target: "S0_Cadence31"
+  keys: ["DataFeed","Symbol","StatName","TradeDate"]
+  pre_sql: |
+    -- optional
+  post_sql: |
+    -- optional
+
+////////////////////////////////////////////////////////////
+${ENV:MMTS_TEST_CONNSTR|...} now resolves at runtime.
+
+${NOW:yyyy-MM-dd} also works anywhere you use it (e.g., default batchId).
+////////////////////////////////////////////////////////////
+If you want to expose step execution from the REPL, add a small branch in Repl.fs:
+...
+| ":run" when parts.Length = 2 ->
+    match st.Workflow with
+    | None -> warn "nothing loaded"
+    | Some wf ->
+        let wf' = withApplied wf st.Overrides
+        let stepId = parts.[1]
+        match Exec.runStep (wf' :?> _) stepId with
+        | Ok summary -> info $"OK: {summary}"
+        | Error err  -> error $"EXEC ERROR: {err}"
+
+////////////////////////////////////////////////////////////
+That’s it—you’ve now got:
+
+real upsert into [schema].[target] using keys,
+
+pre/post SQL hooks,
+
+environment/time interpolation,
+
+and a one-step executor.
+
+////////////////////////////////////////////////////////////
+Great catches, Ami. These are all F# interpolation + piping quirks. 
+Below are surgical fixes you can paste in—no behavioral changes, just making the compiler happy.
+////////////////////////////////////////////////////////////
+1) Interpolation inside emitDryRun (array join)
+
+Problem line (invalid complex expression in $"..."):
+....
+sb.AppendLine($"      arg {kv.Key} = [{String.Join(", ", arr)}]") |> ignore
+Fix: precompute the string, then interpolate:
+
+Fix: precompute the string, then interpolate:
+
+| :? ResizeArray<string> as arr ->
+    let arrStr = String.Join(", ", arr)
+    sb.AppendLine($"      arg {kv.Key} = [{arrStr}]") |> ignore
+...
+
+Replace the whole match kv.Value arm inside emitDryRun with the snippet above.
+////////////////////////////////////////////////////////////
+2) Temp table name interpolation (Guid.NewGuid().ToString("N"))
+
+Problem line (complex expression in $"..."):
+...
+let temp = $"#mmts_tmp_{Guid.NewGuid().ToString("N")}"
+...
+Fix: bind first, then interpolate:
+
+let gid  = Guid.NewGuid().ToString("N")
+let temp = $"#mmts_tmp_{gid}"
+....
+
+
+////////////////////////////////////////////////////////////
+3) String.Join via pipeline (type constraint mismatch)
+
+Problem line (piping into String.Join puts the list in the separator slot):
+...
+Two clean options—pick one:
+
+Option A (recommended): use String.concat
+...
+let createCols =
+    cols
+    |> List.map (fun (n,t) -> $"[{n}] {t} NULL")
+    |> String.concat ", "
+...
+Option B: keep String.Join but pass both args explicitly
+...
+let createCols =
+    let parts = cols |> List.map (fun (n,t) -> $"[{n}] {t} NULL")
+    String.Join(", ", parts)
+
+
+////////////////////////////////////////////////////////////
+4) Cast warning in toDataTable (“always holds”)
+
+You iterated columns as obj and then downcasted. Specify the loop variable type and drop the cast.
+
+Original:
+....
+for c in dt.Columns do
+    let dc = c :?> Data.DataColumn
+    bc.ColumnMappings.Add(dc.ColumnName, dc.ColumnName) |> ignore
+
+...
+Fix:
+...
+for c : Data.DataColumn in dt.Columns do
+    bc.ColumnMappings.Add(c.ColumnName, c.ColumnName) |> ignore
+
+Do the same wherever you enumerate dt.Columns (e.g., when building allCols).
+
+Example for allCols:
+let allCols =
+    dt.Columns
+    |> Seq.cast<Data.DataColumn>
+    |> Seq.map (fun c -> c.ColumnName)
+    |> Seq.toList
+...
+This one is already good; keep as-is.
+////////////////////////////////////////////////////////////
+Drop-in patched fragments (ready to paste)
+A) emitDryRun loop for args (replace only the inner lines that print list args)
+...
+////////////////////////////////////////////////////////////
+for kv in r do
+    match kv.Value with
+    | :? ResizeArray<string> as arr ->
+        let arrStr = String.Join(", ", arr)
+        sb.AppendLine($"      arg {kv.Key} = [{arrStr}]") |> ignore
+    | _ ->
+        sb.AppendLine($"      arg {kv.Key} = {kv.Value}") |> ignore
+
+////////////////////////////////////////////////////////////
+B) Temp table name
+...
+let gid  = Guid.NewGuid().ToString("N")
+let temp = $"#mmts_tmp_{gid}"
+
+
+
+////////////////////////////////////////////////////////////
+C) Create-columns string
+
+let createCols =
+    cols
+    |> List.map (fun (n,t) -> $"[{n}] {t} NULL")
+    |> String.concat ", "
+let createTmp = $"CREATE TABLE {temp} ({createCols});"
+
+////////////////////////////////////////////////////////////
+D) BulkCopy column mappings (no cast warning)
+...
+use bc = new SqlBulkCopy(conn)
+bc.DestinationTableName <- temp
+for c : Data.DataColumn in dt.Columns do
+    bc.ColumnMappings.Add(c.ColumnName, c.ColumnName) |> ignore
+bc.WriteToServer(dt)
+
+
+////////////////////////////////////////////////////////////
+
+////////////////////////////////////////////////////////////
+
+////////////////////////////////////////////////////////////
+
+////////////////////////////////////////////////////////////
+
+////////////////////////////////////////////////////////////
+
+////////////////////////////////////////////////////////////
+
+////////////////////////////////////////////////////////////
+
+////////////////////////////////////////////////////////////
+
+////////////////////////////////////////////////////////////
+
+////////////////////////////////////////////////////////////
+
+////////////////////////////////////////////////////////////
+
+////////////////////////////////////////////////////////////
+
