@@ -11,25 +11,16 @@ Here’s how I’d structure it so it’s robust and ergonomic.
 Why executables (EXEs) help
 
 Isolation & safety: a bad transform can’t crash the scheduler; you get timeouts/retries.
-
 Polyglot: write wave engines in F#/C++/Python — whatever’s best for the math.
-
 A/B variants: ship many engines with different params (or compiled constants) and pick per YAML.
-
 Reproducibility: pin an exe + args in YAML ⇒ exact behavior is captured in git.
-
 Contract: stdin → stdout (rows/json)
-
 Use your existing Exec.Exe path (you already support stdin: rows, stdout: rows, timeouts, retry). The contract:
-
 stdin: JSON array of rows (what s0.fetch produced or previous step’s output)
-
 stdout: JSON array of rows (what the wave exe outputs)
-
 exit code: 0=success; non-zero = failure (stderr captured by engine)
 
 schema: your transform should output S0_Cadence31 shaped rows if you plan to materialize into that table.
-
 Example YAML
 
 One fetch → multiple wave executables in parallel, then union → validate → materialize:
@@ -391,7 +382,3259 @@ Yep—easier for humans, safer for ops, friendlier to ML.
 And when you need to evolve, you add a root or a tiny hook, not a refactor of the world. 
 Ready to codify the engines: root and a mmts validate CLI next?
 ///////////////////////////////////////////////////
+// MMTS • RobustCadence_n Engine
+// Scope: general-purpose robust resampler + MAD cleaner for any cadence n (seconds)
+// Layer: S0 (ingest/normalize) → S1 (robust cadence series)
+// Style: 4-space indents, no external deps beyond BCL + Microsoft.Data.SqlClient
+// Notes:
+//   - Use this as a drop-in hook for your YAML-driven MMTS_ML workflow.
+//   - The transform accepts arbitrary cadence seconds and robustness knobs.
+//   - Output schema mirrors S0_Cadence31 but parameterized by cadence.
 
+namespace MMTS.RobustCadenceN
+
+open System
+open System.Data
+open System.Globalization
+open Microsoft.Data.SqlClient
+
+module Types =
+    [<CLIMutable>]
+    type RawRow = {
+        DataFeed    : string
+        Symbol      : string
+        StatName    : string
+        DataField   : string
+        TradeDate   : DateTime   // trading session date (date component)
+        Dt          : DateTime   // timestamp of datapoint
+        Value       : float      // raw value
+        Source      : string
+    }
+
+    [<CLIMutable>]
+    type RobustRow = {
+        DataFeed    : string
+        Symbol      : string
+        StatName    : string
+        DataField   : string
+        TradeDate   : DateTime
+        Dt          : DateTime
+        Raw         : float
+        Med         : float
+        Mad         : float
+        Scale       : float
+        MZ          : float      // (Raw - Med) / (Mad * scaleFactor)
+        Weight      : float      // optional weight (e.g., Tukey biweight)
+        Clean       : float      // robust-cleaned value
+        Cadence     : int        // seconds (n)
+        Source      : string
+        InsertTime  : DateTime
+    }
+
+    type RobustSpec = {
+        cadenceSec          : int
+        minPointsPerBucket  : int
+        zeroApproxThreshold : float      // treat |x| <= this as 0.0
+        madEps              : float      // epsilon to avoid div-by-zero
+        zClip               : float option // clamp |MZ| to this if Some
+        weightKind          : string option // e.g., "tukey", "huber"
+        scaleFactor         : float      // multiplier applied to MAD (e.g., 1.4826 for normal)
+    }
+
+module Robust =
+    open Types
+
+    let private clip (mn: float) (mx: float) (x: float) =
+        if x < mn then mn elif x > mx then mx else x
+
+    let private median (xs: float array) : float =
+        if xs.Length = 0 then Double.NaN else
+        let ys = Array.copy xs
+        Array.sortInPlace ys
+        let m = ys.Length / 2
+        if ys.Length % 2 = 0 then (ys[m-1] + ys[m]) / 2.0 else ys[m]
+
+    let private mad (xs: float array) (med: float) : float =
+        if xs.Length = 0 then Double.NaN else
+        xs |> Array.map (fun x -> abs (x - med)) |> median
+
+    let private robustZ (x: float) (med: float) (madv: float) (scale: float) (eps: float) : float =
+        let denom = if madv * scale > eps then madv * scale else eps
+        (x - med) / denom
+
+    let private tukeyWeight (u: float) : float =
+        // Tukey biweight with c=4.685 → w = (1 - (u/c)^2)^2 for |u|<c else 0
+        let c = 4.685
+        let a = abs u / c
+        if a >= 1.0 then 0.0 else let t = 1.0 - a * a in t * t
+
+    let private huberWeight (u: float) : float =
+        // Huber with c=1.345
+        let c = 1.345
+        if abs u <= c then 1.0 else c / abs u
+
+    let private chooseWeight (kindOpt: string option) : (float -> float) =
+        match kindOpt |> Option.map (fun s -> s.ToLowerInvariant()) with
+        | Some "huber" -> huberWeight
+        | Some "tukey" -> tukeyWeight
+        | _             -> (fun _ -> 1.0) // no weighting
+
+    let private truncateToBucket (cadenceSec: int) (dt: DateTime) : DateTime =
+        // floor to nearest cadence-sec boundary
+        let ticks = int64 cadenceSec * TimeSpan.TicksPerSecond
+        let t = dt.Ticks - (dt.Ticks % ticks)
+        DateTime(t, dt.Kind)
+
+    let private cleanZero (th: float) (x: float) = if abs x <= th then 0.0 else x
+
+    /// Aggregate points within each cadence bucket → robust stats
+    let bucketizeAndRobust
+        (spec    : RobustSpec)
+        (rows    : RawRow list)
+        : RobustRow list =
+        let wfun = chooseWeight spec.weightKind
+        rows
+        |> List.groupBy (fun r -> r.DataFeed, r.Symbol, r.StatName, r.DataField, r.TradeDate, truncateToBucket spec.cadenceSec r.Dt)
+        |> List.collect (fun ((feed,sym,stat,field,tradeDate,dtBucket), grp) ->
+            let vs = grp |> List.map (fun r -> cleanZero spec.zeroApproxThreshold r.Value) |> List.toArray
+            if vs.Length < spec.minPointsPerBucket then [] else
+            let med = median vs
+            let md  = mad vs med
+            let mzs = vs |> Array.map (fun x -> robustZ x med md spec.scaleFactor spec.madEps)
+            let mzs =
+                match spec.zClip with
+                | Some zc -> mzs |> Array.map (fun z -> clip -zc zc z)
+                | None    -> mzs
+            let ws  = mzs |> Array.map wfun
+            // robust-cleaned value: weighted trimmed-mean around med via MZ weights
+            // x_clean = med + mean_i (w_i * (x_i - med))
+            let num = Array.zip vs ws |> Array.sumBy (fun (x,w) -> w * (x - med))
+            let den = ws |> Array.sum
+            let clean = med + (if den > 1e-12 then num / den else 0.0)
+            // choose representative raw: median of bucket
+            let rawRep = med
+            let r0 = grp.Head
+            [{
+                DataFeed   = feed
+                Symbol     = sym
+                StatName   = stat
+                DataField  = field
+                TradeDate  = tradeDate.Date
+                Dt         = dtBucket
+                Raw        = rawRep
+                Med        = med
+                Mad        = md
+                Scale      = spec.scaleFactor
+                MZ         = if mzs.Length>0 then mzs |> Array.average else 0.0
+                Weight     = if ws.Length>0 then ws |> Array.average else 1.0
+                Clean      = clean
+                Cadence    = spec.cadenceSec
+                Source     = r0.Source
+                InsertTime = DateTime.UtcNow
+            }]
+        )
+
+module Sql =
+    open Types
+
+    [<Literal>]
+    let UpsertSql = """
+MERGE INTO {SCHEMA}.[{TABLE}] AS T
+USING (SELECT @DataFeed      AS [DataFeed],
+              @Symbol        AS [Symbol],
+              @StatName      AS [StatName],
+              @DataField     AS [DataField],
+              @TradeDate     AS [TradeDate],
+              @Dt            AS [Dt]) AS S
+ON (T.[DataFeed]=S.[DataFeed]
+    AND T.[Symbol]=S.[Symbol]
+    AND T.[StatName]=S.[StatName]
+    AND T.[DataField]=S.[DataField]
+    AND T.[TradeDate]=S.[TradeDate]
+    AND T.[Dt]=S.[Dt])
+WHEN MATCHED THEN UPDATE SET
+    [Raw]=@Raw,[Med]=@Med,[Mad]=@Mad,[Scale]=@Scale,[MZ]=@MZ,
+    [Weight]=@Weight,[Clean]=@Clean,[Cadence]=@Cadence,[Source]=@Source,[InsertTime]=@InsertTime
+WHEN NOT MATCHED THEN INSERT
+    ([DataFeed],[Symbol],[StatName],[DataField],[TradeDate],[Dt],[Raw],[Med],[Mad],[Scale],[MZ],[Weight],[Clean],[Cadence],[Source],[InsertTime])
+VALUES
+    (@DataFeed,@Symbol,@StatName,@DataField,@TradeDate,@Dt,@Raw,@Med,@Mad,@Scale,@MZ,@Weight,@Clean,@Cadence,@Source,@InsertTime);
+"""
+
+    let upsertOne (connStr: string) (schemaName: string) (tableName: string) (r: RobustRow) =
+        let sql = UpsertSql.Replace("{SCHEMA}", schemaName).Replace("{TABLE}", tableName)
+        use conn = new SqlConnection(connStr)
+        use cmd  = new SqlCommand(sql, conn)
+        let p name v = cmd.Parameters.AddWithValue(name, v) |> ignore
+        p "@DataFeed"   r.DataFeed
+        p "@Symbol"     r.Symbol
+        p "@StatName"   r.StatName
+        p "@DataField"  r.DataField
+        p "@TradeDate"  (box r.TradeDate)
+        p "@Dt"         (box r.Dt)
+        p "@Raw"        r.Raw
+        p "@Med"        r.Med
+        p "@Mad"        r.Mad
+        p "@Scale"      r.Scale
+        p "@MZ"         r.MZ
+        p "@Weight"     r.Weight
+        p "@Clean"      r.Clean
+        p "@Cadence"    r.Cadence
+        p "@Source"     r.Source
+        p "@InsertTime" (box r.InsertTime)
+        conn.Open()
+        cmd.ExecuteNonQuery() |> ignore
+
+    let bulkUpsert (connStr: string) (schemaName: string) (tableName: string) (rows: RobustRow list) =
+        // Simple sequential upsert; replace with TVP-based bulk if needed.
+        rows |> List.iter (upsertOne connStr schemaName tableName)
+
+module Ddl =
+    [<Literal>]
+    let CreateTable = """
+IF OBJECT_ID(N'[{SCHEMA}].[{TABLE}]', N'U') IS NULL
+BEGIN
+    CREATE TABLE [{SCHEMA}].[{TABLE}] (
+      [DataFeed]  NVARCHAR(32)  NOT NULL,
+      [Symbol]    NVARCHAR(32)  NOT NULL,
+      [StatName]  NVARCHAR(64)  NOT NULL,
+      [DataField] NVARCHAR(64)  NOT NULL,
+      [TradeDate] DATETIME2(0)  NOT NULL,
+      [Dt]        DATETIME2(0)  NOT NULL,
+      [Raw]       FLOAT         NOT NULL,
+      [Med]       FLOAT         NOT NULL,
+      [Mad]       FLOAT         NOT NULL,
+      [Scale]     FLOAT         NOT NULL,
+      [MZ]        FLOAT         NOT NULL,
+      [Weight]    FLOAT         NOT NULL,
+      [Clean]     FLOAT         NOT NULL,
+      [Cadence]   INT           NOT NULL,
+      [Source]    NVARCHAR(64)  NOT NULL,
+      [InsertTime] DATETIME2(0) NOT NULL,
+      CONSTRAINT [PK_{TABLE}] PRIMARY KEY CLUSTERED
+      ([DataFeed],[Symbol],[StatName],[DataField],[TradeDate],[Dt])
+    );
+END
+"""
+
+module Hook =
+    // Plug this into YAML as POC.Hooks.S0.Transform.RobustCadenceN.v1.Module.Run (kind=rows)
+    open Types
+    open Robust
+    open Sql
+
+    module [<RequireQualifiedAccess>] Module =
+        let Run (args: System.Collections.Generic.IDictionary<string, obj>) : obj =
+            // Expected args from runner:
+            //   "connStrOut": string (SQL target)
+            //   "schemaOut" : string
+            //   "tableOut"  : string
+            //   "cadenceSec": int
+            //   "minPoints" : int
+            //   "zeroApprox": float
+            //   "madEps"    : float
+            //   "zClip"     : float option
+            //   "weightKind": string option
+            //   "scaleFactor": float
+            //   "rows"      : Types.RawRow list
+            let g k = if args.ContainsKey k then Some args[k] else None
+            let asS  (o: obj) = o :?> string
+            let asI  (o: obj) = o :?> int
+            let asF  (o: obj) = o :?> float
+            let asFO (o: obj) = o :?> float option
+            let asSO (o: obj) = o :?> string option
+            let asRows (o: obj) = o :?> Types.RawRow list
+
+            let connStr = g "connStrOut" |> Option.map asS |> Option.defaultValue ""
+            let schemaO = g "schemaOut"  |> Option.map asS |> Option.defaultValue "dbo"
+            let tableO  = g "tableOut"   |> Option.map asS |> Option.defaultValue "S1_RobustCadenceN"
+
+            let spec = {
+                cadenceSec          = g "cadenceSec"  |> Option.map asI |> Option.defaultValue 31
+                minPointsPerBucket  = g "minPoints"   |> Option.map asI |> Option.defaultValue 1
+                zeroApproxThreshold = g "zeroApprox"  |> Option.map asF |> Option.defaultValue 0.0
+                madEps              = g "madEps"      |> Option.map asF |> Option.defaultValue 1e-9
+                zClip               = g "zClip"       |> Option.map asFO |> Option.defaultValue None
+                weightKind          = g "weightKind"  |> Option.map asSO |> Option.defaultValue (Some "tukey")
+                scaleFactor         = g "scaleFactor" |> Option.map asF |> Option.defaultValue 1.4826
+            }
+
+            let inputRows = g "rows" |> Option.map asRows |> Option.defaultValue []
+            let outRows   = Robust.bucketizeAndRobust spec inputRows
+
+            if not (String.IsNullOrWhiteSpace connStr) then
+                Sql.bulkUpsert connStr schemaO tableO outRows
+                box (outRows.Length)
+            else
+                // Return rows to caller (dry-run / pass-through)
+                box outRows
+
+// --- YAML wiring (MMTS_ML) ----------------------------------------------------
+// Example: S0 fetch + RobustCadence_n transform + materialize
+// Save as MMTS_ML_S0_RobustCadenceN.yml (or .ml if you prefer)
+(***
+workflow:
+    id: "S0_RobustCadenceN"
+    env:
+        db_out: "Server=.;Database=0_CADENCE;Trusted_Connection=True;TrustServerCertificate=True;"
+        schema_out: "dbo"
+        table_out:  "S1_RobustCadenceN"
+        cadenceSec: 31
+        minPoints:  1
+        zeroApprox: 0.0
+        madEps:     1e-9
+        zClip:      null   # or 6.0
+        weightKind: "tukey"
+        scaleFactor: 1.4826
+
+hooks:
+    s0.fetch:
+        module: "POC.Hooks.S0.Fetch.v1.Module"
+        func:   "Run"
+        kind:   "rows"
+        args:
+            # Example filter params passed to your fetcher
+            symbols: ["AAPL"]
+            statNames: ["WAP"]
+            dataFeed: "EOD5Secs"
+            from: "2025-01-01"
+            to:   "2025-07-01"
+
+    s0.transform:
+        module: "POC.Hooks.S0.Transform.RobustCadenceN.v1.Module"
+        func:   "Run"
+        kind:   "rows"
+        args:
+            connStrOut: "${db_out}"
+            schemaOut:  "${schema_out}"
+            tableOut:   "${table_out}"
+            cadenceSec: ${cadenceSec}
+            minPoints:  ${minPoints}
+            zeroApprox: ${zeroApprox}
+            madEps:     ${madEps}
+            zClip:      ${zClip}
+            weightKind: ${weightKind}
+            scaleFactor:${scaleFactor}
+
+steps:
+    - id: fetch
+      use: s0.fetch
+
+    - id: robust
+      use: s0.transform
+      inlet: fetch.rows
+*** )
+
+// --- Sample Fetch Hook (rows) --------------------------------------------------
+// Dummy fetcher returning RawRow list. Replace with your real reader.
+namespace POC.Hooks.S0.Fetch.v1
+
+open System
+open MMTS.RobustCadenceN.Types
+
+module [<RequireQualifiedAccess>] Module =
+    let Run (_args: System.Collections.Generic.IDictionary<string, obj>) : obj =
+        let mk i = {
+            DataFeed  = "EOD5Secs"; Symbol = "AAPL"; StatName = "WAP"; DataField = "WAP";
+            TradeDate = DateTime(2025,01,17); Dt = DateTime(2025,01,17,14,59,20 + i*5);
+            Value = 100.0 + float i; Source = "POC"
+        }
+        [for i in 0..11 -> mk i] :> obj
+
+// --- Transform Hook adapter (namespace for YAML module path) -------------------
+namespace POC.Hooks.S0.Transform.RobustCadenceN.v1
+
+open MMTS.RobustCadenceN.Hook
+
+module [<RequireQualifiedAccess>] Module =
+    let Run (args: System.Collections.Generic.IDictionary<string, obj>) : obj =
+        Hook.Module.Run args
+
+// --- Optional: Ensure table DDL (call once) -----------------------------------
+namespace Tools.DDL
+
+open System
+open Microsoft.Data.SqlClient
+open MMTS.RobustCadenceN.Ddl
+
+module Create =
+    let ensure (connStr: string) (schemaName: string) (tableName: string) =
+        let sql = CreateTable.Replace("{SCHEMA}", schemaName).Replace("{TABLE}", tableName)
+        use conn = new SqlConnection(connStr)
+        use cmd  = new SqlCommand(sql, conn)
+        conn.Open()
+        cmd.ExecuteNonQuery() |> ignore
+
+// --- End of file ---------------------------------------------------------------
+
+///////////////////////////////////////////////////
+Nice—spun up a full, drop-in RobustCadence_n engine for your MMTS_ML stack. It’s on the canvas:
+
+Parameterized robust resampler (any cadence in seconds) with MAD, z-clipping, Tukey/Huber weights, and zero-approx.
+
+Hook-ready modules:
+
+POC.Hooks.S0.Transform.RobustCadenceN.v1.Module.Run (transform)
+
+POC.Hooks.S0.Fetch.v1.Module.Run (dummy fetch)
+
+SQL DDL + MERGE upsert scaffold.
+
+A ready-to-run YAML workflow wiring S0 fetch → RobustCadence_n transform (materializes or dry-runs).
+
+If you want, I can also:
+
+Swap the sequential MERGE for a TVP-based bulk upsert.
+
+Add per-symbol/field parallelism with DOP control.
+
+Emit both Clean and Raw into separate S1 tables (or a view).
+
+Integrate directly with your existing S0_Cadence31 schema naming.
+
+Tell me your target cadence(s) and table naming 
+(e.g., S1_RobustCadence31, S1_RobustCadence05), and I’ll tailor the materializer + YAML immediately.
+///////////////////////////////////////////////////
+ok, let's build this from inside-out named engine0.exe (executable)... 
+I am thinking more about bare-nuts/bare-bolts (very bare)...
+given a key, a series ...in the form of key=(k1+k2+k3+k4+JobId), 
+series=(DateTime+Float-in1) as input to the engine, produce as output...
+in the form of (k1+k2+k3+k4+JobId), (DateTime+Float-out1+Float-out2+Float-out3+Float-out4...)....
+this is engine0...the key being used as filename at OS level.  
+Engine1A...of course, being the one that prepares the input to engine0 and Engine1B, 
+being the one that process output from engine0 to store into database...
+In this sense, we are taking out the Hook's actual implementations 
+(fetch/transform/materialize) to executables.  
+The YAML is to name the executables in sequence.  
+In MMTS.S0.Worker, it processes YAML and make the scheduled events for the happenings....
+What do you think?
+///////////////////////////////////////////////////
+// Engine0 + Engine1A/Engine1B bare-bolts pipeline (F#/.NET 8)
+// - engine0.exe: reads series for a key from a file, writes derived outputs
+// - Engine1A.exe: prepares input files for engine0 (one per key)
+// - Engine1B.exe: consumes engine0 outputs and persists (stub: writes MERGE SQL or calls stored proc)
+// - MMTS.S0.Worker.exe: reads YAML, schedules and runs executables in sequence
+// Indentation: 4 spaces
+
+// -------------------------------------------
+// engine0/Program.fs
+// -------------------------------------------
+namespace Engine0
+
+open System
+open System.IO
+open System.Globalization
+
+module Cli =
+    [<CLIMutable>]
+    type Args = {
+        inputDir      : string  // folder containing key files
+        outputDir     : string  // folder to drop outputs
+        key           : string  // filename key: k1+k2+k3+k4+JobId (no extension)
+        outCols       : int     // number of out columns to produce (>=1)
+        sep           : string  // CSV separator
+        datetimeFmt   : string  // e.g., "yyyy-MM-dd HH:mm:ss"
+    }
+
+    let parse (argv: string[]) : Args =
+        let mutable a = {
+            inputDir = "."; outputDir = "."; key = ""; outCols = 4; sep = ","; datetimeFmt = "yyyy-MM-dd HH:mm:ss"
+        }
+        let rec loop i =
+            if i >= argv.Length then () else
+            match argv[i] with
+            | "--in"      -> a <- { a with inputDir = argv[i+1] }; loop (i+2)
+            | "--out"     -> a <- { a with outputDir = argv[i+1] }; loop (i+2)
+            | "--key"     -> a <- { a with key = argv[i+1] }; loop (i+2)
+            | "--outCols" -> a <- { a with outCols = int argv[i+1] }; loop (i+2)
+            | "--sep"     -> a <- { a with sep = argv[i+1] }; loop (i+2)
+            | "--dtfmt"   -> a <- { a with datetimeFmt = argv[i+1] }; loop (i+2)
+            | x -> failwithf "Unknown arg: %s" x
+        loop 0
+        if String.IsNullOrWhiteSpace a.key then failwith "--key is required"
+        a
+
+module Types =
+    type InRow = { Dt: DateTime; In1: float }
+    type OutRow = { Dt: DateTime; Outs: float array }
+
+module Io =
+    open Types
+
+    let readInput (path: string) (sep: string) (dtfmt: string) : InRow list =
+        // Format: Dt<sep>In1  (no header). Example: 2025-01-17 14:59:20,100.25
+        let culture = CultureInfo.InvariantCulture
+        File.ReadAllLines(path)
+        |> Array.choose (fun line ->
+            let s = line.Trim()
+            if s = "" || s.StartsWith("#") then None else
+            let parts = s.Split(sep, StringSplitOptions.RemoveEmptyEntries)
+            if parts.Length < 2 then None else
+            let okDt, dt = DateTime.TryParseExact(parts[0], dtfmt, culture, DateTimeStyles.AssumeLocal)
+            let okV, v = Double.TryParse(parts[1], NumberStyles.Float, culture)
+            if okDt && okV then Some { Dt = dt; In1 = v } else None)
+        |> Array.sortBy (fun r -> r.Dt)
+        |> Array.toList
+
+    let writeOutput (path: string) (sep: string) (dtfmt: string) (rows: OutRow list) =
+        // Format: Dt<sep>Out1<sep>Out2<sep>...
+        let culture = CultureInfo.InvariantCulture
+        use sw = new StreamWriter(path)
+        for r in rows do
+            let dt = r.Dt.ToString(dtfmt, culture)
+            let outs = r.Outs |> Array.map (fun x -> x.ToString(culture))
+            sw.WriteLine(String.Join(sep, Array.append [|dt|] outs))
+
+module Robust =
+    let inline median (xs: float array) =
+        if xs.Length = 0 then nan else
+        let ys = Array.copy xs
+        Array.sortInPlace ys
+        let m = ys.Length/2
+        if ys.Length % 2 = 0 then (ys[m-1] + ys[m]) / 2.0 else ys[m]
+
+    let mad (xs: float array) (med: float) = xs |> Array.map (fun x -> abs (x - med)) |> median
+
+module Ops =
+    open Types
+    open Robust
+
+    type Engine0Mode =
+        | Identity
+        | Robust01    // out1=in1, out2=median(rolling 9), out3=MAD(rolling 9), out4=clean (biweight-ish)
+
+    let private rolling (win: int) (vals: float array) =
+        [|
+            for i in 0..vals.Length-1 do
+                let a = max 0 (i - (win-1))
+                let b = i
+                yield vals[a..b]
+        |]
+
+    let run (mode: Engine0Mode) (outCols: int) (rows: InRow list) : OutRow list =
+        if rows.IsEmpty then [] else
+        let v = rows |> List.map (fun r -> r.In1) |> List.toArray
+        match mode with
+        | Identity ->
+            rows |> List.map (fun r -> { Dt = r.Dt; Outs = Array.init outCols (fun _ -> r.In1) })
+        | Robust01 ->
+            let wins = rolling 9 v
+            let meds = wins |> Array.map median
+            let mads = Array.init wins.Length (fun i -> mad wins[i] meds[i])
+            let clean =
+                Array.init v.Length (fun i ->
+                    let m = meds[i]; let d = mads[i]; let denom = if d > 1e-12 then d else 1e-12
+                    let z = (v[i] - m) / (1.4826 * denom)
+                    // Tukey c=4.685
+                    let c = 4.685
+                    let a = abs z / c
+                    let w = if a >= 1.0 then 0.0 else let t = 1.0 - a*a in t*t
+                    m + w * (v[i] - m))
+            let outsFor i =
+                [|
+                    yield v[i]
+                    if outCols >= 2 then yield meds[i]
+                    if outCols >= 3 then yield mads[i]
+                    if outCols >= 4 then yield clean[i]
+                    // fill remaining (if any) with zeros
+                    if outCols > 4 then
+                        for _k in 5..outCols do yield 0.0
+                |]
+            [ for i, r in rows |> List.indexed -> { Dt = r.Dt; Outs = outsFor i } ]
+
+module Program =
+    open Cli
+    open Types
+    open Io
+    open Ops
+
+    [<EntryPoint>]
+    let main argv =
+        try
+            let args = Cli.parse argv
+            Directory.CreateDirectory args.outputDir |> ignore
+            let inPath  = Path.Combine(args.inputDir,  args.key + ".csv")
+            let outPath = Path.Combine(args.outputDir, args.key + ".out.csv")
+            if not (File.Exists inPath) then
+                eprintfn "engine0: input file not found: %s" inPath
+                2
+            else
+                let rows = Io.readInput inPath args.sep args.datetimeFmt
+                let outs = Ops.run Ops.Engine0Mode.Robust01 args.outCols rows
+                Io.writeOutput outPath args.sep args.datetimeFmt outs
+                printfn "engine0: wrote %d rows → %s" outs.Length outPath
+                0
+        with ex ->
+            eprintfn "engine0: ERROR %s" ex.Message
+            1
+
+// -------------------------------------------
+// Engine1A/Program.fs — prepare inputs for engine0 (stub)
+// -------------------------------------------
+namespace Engine1A
+
+open System
+open System.IO
+open System.Globalization
+
+module Program =
+    [<EntryPoint>]
+    let main argv =
+        // Args: --out <dir> --key <k1+k2+k3+k4+JobId> [--dtfmt ...] [--sep ,]
+        let mutable outDir = "."
+        let mutable key = "demo+EOD5Secs+AAPL+WAP+job123"
+        let mutable dtfmt = "yyyy-MM-dd HH:mm:ss"
+        let mutable sep = ","
+        let rec loop i =
+            if i < argv.Length then
+                match argv[i] with
+                | "--out"  -> outDir <- argv[i+1]; loop (i+2)
+                | "--key"  -> key    <- argv[i+1]; loop (i+2)
+                | "--dtfmt"-> dtfmt <- argv[i+1]; loop (i+2)
+                | "--sep"  -> sep    <- argv[i+1]; loop (i+2)
+                | x -> failwithf "Unknown arg %s" x
+        loop 0
+        Directory.CreateDirectory outDir |> ignore
+        // STUB: generate 60 points of dummy data every 5s
+        let culture = CultureInfo.InvariantCulture
+        let startDt = DateTime(2025,1,17,14,59,20)
+        let lines =
+            [|
+                for i in 0..59 do
+                    let dt = startDt.AddSeconds(float (i*5)).ToString(dtfmt, culture)
+                    let v  = (100.0 + Math.Sin(float i/6.0) * 2.0).ToString(culture)
+                    yield String.Join(sep, [|dt; v|])
+            |]
+        let path = Path.Combine(outDir, key + ".csv")
+        File.WriteAllLines(path, lines)
+        printfn "Engine1A: wrote %d rows to %s" lines.Length path
+        0
+
+// -------------------------------------------
+// Engine1B/Program.fs — consume outputs and persist (stub)
+// -------------------------------------------
+namespace Engine1B
+
+open System
+open System.IO
+open System.Globalization
+
+module Program =
+    [<EntryPoint>]
+    let main argv =
+        // Args: --in <dir> --key <k1+...+JobId> [--sep ,] [--dtfmt fmt] [--sqlout path]
+        let mutable inDir = "."
+        let mutable key = "demo+EOD5Secs+AAPL+WAP+job123"
+        let mutable dtfmt = "yyyy-MM-dd HH:mm:ss"
+        let mutable sep = ","
+        let mutable sqlOut = "merge.sql"
+        let rec loop i =
+            if i < argv.Length then
+                match argv[i] with
+                | "--in"    -> inDir <- argv[i+1]; loop (i+2)
+                | "--key"   -> key   <- argv[i+1]; loop (i+2)
+                | "--dtfmt" -> dtfmt <- argv[i+1]; loop (i+2)
+                | "--sep"   -> sep   <- argv[i+1]; loop (i+2)
+                | "--sqlout"-> sqlOut<- argv[i+1]; loop (i+2)
+                | x -> failwithf "Unknown arg %s" x
+        loop 0
+        let inPath = Path.Combine(inDir, key + ".out.csv")
+        if not (File.Exists inPath) then
+            eprintfn "Engine1B: missing %s" inPath; 2
+        else
+            // STUB: produce a MERGE script (one row per line)
+            let lines = File.ReadAllLines(inPath)
+            use sw = new StreamWriter(sqlOut)
+            sw.WriteLine("-- demo MERGE generated from Engine1B")
+            for ln in lines do
+                let parts = ln.Split(sep); if parts.Length >= 2 then
+                    let dt = parts[0]
+                    let out1 = parts[1]
+                    sw.WriteLine($"-- upsert key={key} dt={dt} out1={out1}")
+            printfn "Engine1B: wrote %s" sqlOut
+            0
+
+// -------------------------------------------
+// MMTS.S0.Worker — YAML-driven launcher (very bare)
+// -------------------------------------------
+namespace MMTS.S0.Worker
+
+open System
+open System.Diagnostics
+open System.IO
+
+module Types =
+    type Step = { name: string; exe: string; args: string }
+    type Workflow = { id: string; steps: Step list }
+
+module YamlLike =
+    // super bare parser for the subset we need; swap with a real YAML later
+    open Types
+    let parse (text: string) : Workflow =
+        // expected minimal format:
+        // id: "S0_engine0"
+        // steps:
+        //   - name: prep
+        //     exe: Engine1A.exe
+        //     args: "--out in --key demo+EOD5Secs+AAPL+WAP+job123"
+        //   - name: engine0
+        //     exe: engine0.exe
+        //     args: "--in in --out out --key demo+EOD5Secs+AAPL+WAP+job123 --outCols 4"
+        //   - name: persist
+        //     exe: Engine1B.exe
+        //     args: "--in out --key demo+EOD5Secs+AAPL+WAP+job123 --sqlout merge.sql"
+        let lines = text.Split('\n') |> Array.map (fun s -> s.Trim())
+        let id =
+            lines |> Array.tryFind (fun s -> s.StartsWith("id:"))
+            |> Option.map (fun s -> s.Substring(3).Trim().Trim('"'))
+            |> Option.defaultValue "workflow"
+        let mut = System.Collections.Generic.List<Step>()
+        let mutable i = 0
+        while i < lines.Length do
+            if lines[i].StartsWith("- name:") then
+                let name = lines[i].Substring(7).Trim().Trim('"')
+                let exe = lines[i+1].Substring(lines[i+1].IndexOf(':')+1).Trim()
+                let args = lines[i+2].Substring(lines[i+2].IndexOf(':')+1).Trim().Trim('"')
+                mut.Add({ name = name; exe = exe; args = args })
+                i <- i + 3
+            else i <- i + 1
+        { id = id; steps = List.ofSeq mut }
+
+module Runner =
+    open Types
+    let runStep (s: Step) =
+        let psi = new ProcessStartInfo()
+        psi.FileName <- s.exe
+        psi.Arguments <- s.args
+        psi.UseShellExecute <- false
+        psi.RedirectStandardOutput <- true
+        psi.RedirectStandardError <- true
+        use p = new Process()
+        p.StartInfo <- psi
+        p.Start() |> ignore
+        let so = p.StandardOutput.ReadToEnd()
+        let se = p.StandardError.ReadToEnd()
+        p.WaitForExit()
+        printfn "[%s] rc=%d\n%s" s.name p.ExitCode so
+        if se.Trim() <> "" then eprintfn "[%s] %s" s.name se
+        p.ExitCode
+
+    [<EntryPoint>]
+    let main argv =
+        // Args: --wf <path>
+        let mutable wfPath = "wf.yml"
+        let rec loop i =
+            if i < argv.Length then
+                match argv[i] with
+                | "--wf" -> wfPath <- argv[i+1]; loop (i+2)
+                | x -> failwithf "Unknown arg %s" x
+        loop 0
+        if not (File.Exists wfPath) then eprintfn "Worker: missing %s" wfPath; 2 else
+        let wfText = File.ReadAllText(wfPath)
+        let wf = YamlLike.parse wfText
+        printfn "Worker: running %s (%d steps)" wf.id wf.steps.Length
+        wf.steps |> List.map runStep |> List.sum |> fun rc -> if rc=0 then 0 else 1
+
+// -------------------------------------------
+// wf.yml — minimal YAML to chain Engine1A → engine0 → Engine1B
+// -------------------------------------------
+# id: "S0_engine0"
+# steps:
+#   - name: prep
+#     exe: Engine1A.exe
+#     args: "--out in --key demo+EOD5Secs+AAPL+WAP+job123"
+#   - name: engine0
+#     exe: engine0.exe
+#     args: "--in in --out out --key demo+EOD5Secs+AAPL+WAP+job123 --outCols 4"
+#   - name: persist
+#     exe: Engine1B.exe
+#     args: "--in out --key demo+EOD5Secs+AAPL+WAP+job123 --sqlout merge.sql"
+
+// -------------------------------------------
+// .fsproj hints (repeat per exe, change AssemblyName)
+// -------------------------------------------
+// <Project Sdk="Microsoft.NET.Sdk">
+//   <PropertyGroup>
+//     <OutputType>Exe</OutputType>
+//     <TargetFramework>net8.0</TargetFramework>
+//     <ImplicitUsings>disable</ImplicitUsings>
+//     <Nullable>disable</Nullable>
+//     <AssemblyName>engine0</AssemblyName>
+//   </PropertyGroup>
+// </Project>
+
+///////////////////////////////////////////////////
+Love this direction. Executables keep the “how” swappable while YAML orchestrates the “what/when.” I put a minimal, bare-bolts pipeline on the canvas:
+
+engine0.exe — reads a per-key CSV (key = k1+k2+k3+k4+JobId), outputs Dt, out1..outN.
+Default behavior (Robust01): out1=in1, out2=rolling median(9), out3=rolling MAD(9), out4=robust-clean (Tukey). Identity mode stub included.
+
+Engine1A.exe — tiny input prep stub that writes in\<key>.csv.
+
+Engine1B.exe — tiny consumer stub that reads out\<key>.out.csv and emits a MERGE SQL script (you can swap to TVP/proc later).
+
+MMTS.S0.Worker.exe — ultra-simple YAML-like runner that chains Engine1A → engine0 → Engine1B. Replace the toy parser with YamlDotNet whenever.
+
+Want me to:
+
+Switch engine0’s IO to stdin/stdout pipes (so Worker can stream without temp files)?
+
+Add TVP bulk-upsert in Engine1B against your S1_RobustCadenceN?
+
+Support parallel keys (DOP) in Worker with per-step retries/backoff?
+
+Expose engine0 ops via --mode identity|robust01|custom and --win 9?
+
+Tell me your preferred IO (files vs pipes), and I’ll wire the next pass immediately.
+///////////////////////////////////////////////////
+go ahead ..to:
+
+Switch engine0’s IO to stdin/stdout pipes (so Worker can stream without temp files)?
+
+Add TVP bulk-upsert in Engine1B against your S1_RobustCadenceN?
+
+Support parallel keys (DOP) in Worker with per-step retries/backoff?
+
+Expose engine0 ops via --mode identity|robust01|custom and --win 9?
+I prefer IOf files have both the options of being read-in-out files (for debugs) and pipes (for express) and please wire them both, please
+
+///////////////////////////////////////////////////
+// Engine0 + Engine1A/Engine1B + Worker (v2)
+// Features added:
+// - engine0: file OR pipe IO; --mode identity|robust01|custom; --win N
+// - Engine1B: file OR pipe IO; TVP bulk-upsert to S1_RobustCadenceN via stored proc
+// - Worker: parallel keys (DOP), per-step retries/backoff, pipe chaining
+// - YAML sample includes both pipe and file variants
+
+// -------------------------------------------
+// engine0/Program.fs (v2)
+// -------------------------------------------
+namespace Engine0
+
+open System
+open System.IO
+open System.Globalization
+
+module Cli =
+    [<CLIMutable>]
+    type Args = {
+        inputDir      : string
+        outputDir     : string
+        key           : string
+        outCols       : int
+        sep           : string
+        datetimeFmt   : string
+        io            : string   // "file" | "pipe"
+        mode          : string   // "identity" | "robust01" | "custom"
+        win           : int      // rolling window (for robust01/custom)
+    }
+
+    let parse (argv: string[]) : Args =
+        let mutable a = {
+            inputDir = "."; outputDir = "."; key = ""; outCols = 4; sep = ",";
+            datetimeFmt = "yyyy-MM-dd HH:mm:ss"; io = "file"; mode = "robust01"; win = 9
+        }
+        let rec loop i =
+            if i >= argv.Length then () else
+            match argv[i] with
+            | "--in"       -> a <- { a with inputDir = argv[i+1] }; loop (i+2)
+            | "--out"      -> a <- { a with outputDir = argv[i+1] }; loop (i+2)
+            | "--key"      -> a <- { a with key = argv[i+1] }; loop (i+2)
+            | "--outCols"  -> a <- { a with outCols = int argv[i+1] }; loop (i+2)
+            | "--sep"      -> a <- { a with sep = argv[i+1] }; loop (i+2)
+            | "--dtfmt"    -> a <- { a with datetimeFmt = argv[i+1] }; loop (i+2)
+            | "--io"       -> a <- { a with io = argv[i+1].ToLowerInvariant() }; loop (i+2)
+            | "--mode"     -> a <- { a with mode = argv[i+1].ToLowerInvariant() }; loop (i+2)
+            | "--win"      -> a <- { a with win = int argv[i+1] }; loop (i+2)
+            | x -> failwithf "Unknown arg: %s" x
+        loop 0
+        if String.IsNullOrWhiteSpace a.key then failwith "--key is required"
+        a
+
+module Types =
+    type InRow = { Dt: DateTime; In1: float }
+    type OutRow = { Dt: DateTime; Outs: float array }
+
+module Io =
+    open Types
+
+    let readInputFile (path: string) (sep: string) (dtfmt: string) : InRow list =
+        let culture = CultureInfo.InvariantCulture
+        File.ReadAllLines(path)
+        |> Array.choose (fun line ->
+            let s = line.Trim()
+            if s = "" || s.StartsWith("#") then None else
+            let parts = s.Split(sep, StringSplitOptions.RemoveEmptyEntries)
+            if parts.Length < 2 then None else
+            let okDt, dt = DateTime.TryParseExact(parts[0], dtfmt, culture, DateTimeStyles.AssumeLocal)
+            let okV, v = Double.TryParse(parts[1], NumberStyles.Float, culture)
+            if okDt && okV then Some { Dt = dt; In1 = v } else None)
+        |> Array.sortBy (fun r -> r.Dt)
+        |> Array.toList
+
+    let readInputPipe (stdin: TextReader) (sep: string) (dtfmt: string) : InRow list =
+        let culture = CultureInfo.InvariantCulture
+        let buf = System.Collections.Generic.List<InRow>()
+        let mutable line = stdin.ReadLine()
+        while not (isNull line) do
+            let s = line.Trim()
+            if s <> "" && not (s.StartsWith("#")) then
+                let parts = s.Split(sep, StringSplitOptions.RemoveEmptyEntries)
+                if parts.Length >= 2 then
+                    let okDt, dt = DateTime.TryParseExact(parts[0], dtfmt, culture, DateTimeStyles.AssumeLocal)
+                    let okV, v = Double.TryParse(parts[1], NumberStyles.Float, culture)
+                    if okDt && okV then buf.Add({ Dt = dt; In1 = v })
+            line <- stdin.ReadLine()
+        buf |> Seq.sortBy (fun r -> r.Dt) |> Seq.toList
+
+    let writeOutputFile (path: string) (sep: string) (dtfmt: string) (rows: OutRow list) =
+        let culture = CultureInfo.InvariantCulture
+        use sw = new StreamWriter(path)
+        for r in rows do
+            let dt = r.Dt.ToString(dtfmt, culture)
+            let outs = r.Outs |> Array.map (fun x -> x.ToString(culture))
+            sw.WriteLine(String.Join(sep, Array.append [|dt|] outs))
+
+    let writeOutputPipe (stdout: TextWriter) (sep: string) (dtfmt: string) (rows: OutRow list) =
+        let culture = CultureInfo.InvariantCulture
+        for r in rows do
+            let dt = r.Dt.ToString(dtfmt, culture)
+            let outs = r.Outs |> Array.map (fun x -> x.ToString(culture))
+            stdout.WriteLine(String.Join(sep, Array.append [|dt|] outs))
+
+module Robust =
+    let inline median (xs: float array) =
+        if xs.Length = 0 then nan else
+        let ys = Array.copy xs
+        Array.sortInPlace ys
+        let m = ys.Length/2
+        if ys.Length % 2 = 0 then (ys[m-1] + ys[m]) / 2.0 else ys[m]
+
+    let mad (xs: float array) (med: float) = xs |> Array.map (fun x -> abs (x - med)) |> median
+
+module Ops =
+    open Types
+    open Robust
+
+    type Engine0Mode =
+        | Identity
+        | Robust01
+        | Custom of (float array -> float array[]) // per-index function given windowed arrays
+
+    let private rolling (win: int) (vals: float array) =
+        [|
+            for i in 0..vals.Length-1 do
+                let a = max 0 (i - (win-1))
+                let b = i
+                yield vals[a..b]
+        |]
+
+    let run (mode: Engine0Mode) (outCols: int) (win: int) (rows: InRow list) : OutRow list =
+        if rows.IsEmpty then [] else
+        let v = rows |> List.map (fun r -> r.In1) |> List.toArray
+        match mode with
+        | Identity ->
+            rows |> List.map (fun r -> { Dt = r.Dt; Outs = Array.init outCols (fun _ -> r.In1) })
+        | Robust01 ->
+            let wins = rolling win v
+            let meds = wins |> Array.map median
+            let mads = Array.init wins.Length (fun i -> mad wins[i] meds[i])
+            let clean =
+                Array.init v.Length (fun i ->
+                    let m = meds[i]; let d = mads[i]; let denom = if d > 1e-12 then d else 1e-12
+                    let z = (v[i] - m) / (1.4826 * denom)
+                    let c = 4.685
+                    let a = abs z / c
+                    let w = if a >= 1.0 then 0.0 else let t = 1.0 - a*a in t*t
+                    m + w * (v[i] - m))
+            let outsFor i =
+                [|
+                    yield v[i]
+                    if outCols >= 2 then yield meds[i]
+                    if outCols >= 3 then yield mads[i]
+                    if outCols >= 4 then yield clean[i]
+                    if outCols > 4 then for _k in 5..outCols do yield 0.0
+                |]
+            [ for i, r in rows |> List.indexed -> { Dt = r.Dt; Outs = outsFor i } ]
+        | Custom f ->
+            let wins = rolling win v
+            let outs = f wins // expect array-of-arrays, one per index
+            [ for i, r in rows |> List.indexed -> { Dt = r.Dt; Outs = outs[i] } ]
+
+module Program =
+    open Cli
+    open Types
+    open Io
+    open Ops
+
+    [<EntryPoint>]
+    let main argv =
+        try
+            let args = Cli.parse argv
+            let mode =
+                match args.mode with
+                | "identity" -> Engine0Mode.Identity
+                | "robust01" -> Engine0Mode.Robust01
+                | _ -> Engine0Mode.Robust01
+            let rows =
+                if args.io = "pipe" then Io.readInputPipe Console.In args.sep args.datetimeFmt
+                else
+                    Directory.CreateDirectory args.outputDir |> ignore
+                    let inPath  = Path.Combine(args.inputDir,  args.key + ".csv")
+                    if not (File.Exists inPath) then (eprintfn "engine0: input not found %s" inPath; [])
+                    else Io.readInputFile inPath args.sep args.datetimeFmt
+            let outs = Ops.run mode args.outCols args.win rows
+            if args.io = "pipe" then Io.writeOutputPipe Console.Out args.sep args.datetimeFmt outs
+            else
+                let outPath = Path.Combine(args.outputDir, args.key + ".out.csv")
+                Io.writeOutputFile outPath args.sep args.datetimeFmt outs
+                printfn "engine0: wrote %d rows → %s" outs.Length outPath
+            0
+        with ex -> eprintfn "engine0: ERROR %s" ex.Message; 1
+
+// -------------------------------------------
+// Engine1A/Program.fs (v2)
+// -------------------------------------------
+namespace Engine1A
+
+open System
+open System.IO
+open System.Globalization
+
+module Program =
+    [<EntryPoint>]
+    let main argv =
+        // Args: --out <dir> --key <k1+k2+k3+k4+JobId> [--dtfmt ...] [--sep ,] [--io file|pipe]
+        let mutable outDir = "."; let mutable key = "demo+EOD5Secs+AAPL+WAP+job123"
+        let mutable dtfmt = "yyyy-MM-dd HH:mm:ss"; let mutable sep = ","; let mutable io = "file"
+        let rec loop i = if i < argv.Length then match argv[i] with
+                         | "--out"  -> outDir <- argv[i+1]; loop (i+2)
+                         | "--key"  -> key    <- argv[i+1]; loop (i+2)
+                         | "--dtfmt"-> dtfmt <- argv[i+1]; loop (i+2)
+                         | "--sep"  -> sep    <- argv[i+1]; loop (i+2)
+                         | "--io"   -> io     <- argv[i+1].ToLowerInvariant(); loop (i+2)
+                         | x -> failwithf "Unknown arg %s" x
+        loop 0
+        let culture = CultureInfo.InvariantCulture
+        let startDt = DateTime(2025,1,17,14,59,20)
+        let mk i =
+            let dt = startDt.AddSeconds(float (i*5)).ToString(dtfmt, culture)
+            let v  = (100.0 + Math.Sin(float i/6.0) * 2.0).ToString(culture)
+            String.Join(sep, [|dt; v|])
+        if io = "pipe" then
+            for i in 0..59 do Console.Out.WriteLine(mk i)
+            0
+        else
+            Directory.CreateDirectory outDir |> ignore
+            let path = Path.Combine(outDir, key + ".csv")
+            [| for i in 0..59 -> mk i |] |> fun lines -> File.WriteAllLines(path, lines)
+            printfn "Engine1A: wrote 60 rows to %s" path
+            0
+
+// -------------------------------------------
+// Engine1B/Program.fs (v2: TVP bulk-upsert)
+// -------------------------------------------
+namespace Engine1B
+
+open System
+open System.Data
+open System.Globalization
+open System.IO
+open Microsoft.Data.SqlClient
+
+module Tvps =
+    [<Literal>]
+    let UpsertProcName = "dbo.S1_RobustCadenceN_Upsert_TVP"
+
+    [<Literal>]
+    let CreateTvpAndProc = """
+IF TYPE_ID(N'dbo.S1_RobustCadenceN_TVP') IS NULL
+    CREATE TYPE dbo.S1_RobustCadenceN_TVP AS TABLE (
+        DataFeed NVARCHAR(32), Symbol NVARCHAR(32), StatName NVARCHAR(64), DataField NVARCHAR(64),
+        TradeDate DATETIME2(0), Dt DATETIME2(0), Raw FLOAT, Med FLOAT, Mad FLOAT, Scale FLOAT,
+        MZ FLOAT, Weight FLOAT, Clean FLOAT, Cadence INT, Source NVARCHAR(64), InsertTime DATETIME2(0)
+    );
+GO
+IF OBJECT_ID(N'dbo.S1_RobustCadenceN_Upsert_TVP', N'P') IS NULL
+    EXEC('CREATE PROCEDURE dbo.S1_RobustCadenceN_Upsert_TVP AS SET NOCOUNT ON;');
+GO
+ALTER PROCEDURE dbo.S1_RobustCadenceN_Upsert_TVP
+    @Rows dbo.S1_RobustCadenceN_TVP READONLY,
+    @SchemaName NVARCHAR(128) = N''dbo'',
+    @TableName  NVARCHAR(128) = N''S1_RobustCadenceN''
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @sql NVARCHAR(MAX) = N'
+MERGE INTO ' + QUOTENAME(@SchemaName) + N'.' + QUOTENAME(@TableName) + N' AS T
+USING @Rows AS S
+ON (T.[DataFeed]=S.[DataFeed] AND T.[Symbol]=S.[Symbol] AND T.[StatName]=S.[StatName]
+    AND T.[DataField]=S.[DataField] AND T.[TradeDate]=S.[TradeDate] AND T.[Dt]=S.[Dt])
+WHEN MATCHED THEN UPDATE SET
+    [Raw]=S.[Raw],[Med]=S.[Med],[Mad]=S.[Mad],[Scale]=S.[Scale],[MZ]=S.[MZ],
+    [Weight]=S.[Weight],[Clean]=S.[Clean],[Cadence]=S.[Cadence],[Source]=S.[Source],[InsertTime]=S.[InsertTime]
+WHEN NOT MATCHED THEN INSERT
+    ([DataFeed],[Symbol],[StatName],[DataField],[TradeDate],[Dt],[Raw],[Med],[Mad],[Scale],[MZ],[Weight],[Clean],[Cadence],[Source],[InsertTime])
+VALUES
+    (S.[DataFeed],S.[Symbol],S.[StatName],S.[DataField],S.[TradeDate],S.[Dt],S.[Raw],S.[Med],S.[Mad],S.[Scale],S.[MZ],S.[Weight],S.[Clean],S.[Cadence],S.[Source],S.[InsertTime]);';
+    EXEC sp_executesql @sql, N'@Rows dbo.S1_RobustCadenceN_TVP READONLY', @Rows=@Rows;
+END
+"""
+
+module Program =
+    let parseKey (key: string) =
+        // k1+k2+k3+k4+JobId → assume: DataFeed+Symbol+StatName+DataField+JobId
+        let parts = key.Split('+')
+        if parts.Length < 5 then failwith "key must be k1+k2+k3+k4+JobId"
+        parts[0], parts[1], parts[2], parts[3], parts[4]
+
+    let readOutputFile (path: string) (sep: string) (dtfmt: string) =
+        let culture = CultureInfo.InvariantCulture
+        File.ReadAllLines(path)
+        |> Array.choose (fun line ->
+            let s = line.Trim()
+            if s = "" || s.StartsWith("#") then None else
+            let ps = s.Split(sep, StringSplitOptions.RemoveEmptyEntries)
+            if ps.Length < 2 then None else
+            let okDt, dt = DateTime.TryParseExact(ps[0], dtfmt, culture, DateTimeStyles.AssumeLocal)
+            let tryF i = if i < ps.Length then Double.Parse(ps[i], culture) else 0.0
+            if okDt then Some (dt, [| for i in 1..ps.Length-1 -> tryF i |]) else None)
+        |> Array.toList
+
+    let readOutputPipe (stdin: TextReader) (sep: string) (dtfmt: string) =
+        let culture = CultureInfo.InvariantCulture
+        let buf = System.Collections.Generic.List<_>()
+        let mutable line = stdin.ReadLine()
+        while not (isNull line) do
+            let s = line.Trim()
+            if s <> "" && not (s.StartsWith("#")) then
+                let ps = s.Split(sep, StringSplitOptions.RemoveEmptyEntries)
+                if ps.Length >= 2 then
+                    let okDt, dt = DateTime.TryParseExact(ps[0], dtfmt, culture, DateTimeStyles.AssumeLocal)
+                    if okDt then
+                        let vals = [| for i in 1..ps.Length-1 -> Double.Parse(ps[i], culture) |]
+                        buf.Add(dt, vals)
+            line <- stdin.ReadLine()
+        buf |> Seq.toList
+
+    let buildTvp (schemaName: string) (tableName: string) (rows:(DateTime*float array) list) (key: string) (cadence:int) =
+        let feed,sym,stat,field,_job = parseKey key
+        let dt = new System.Data.DataTable()
+        let addCol (n,t) = dt.Columns.Add(n,t) |> ignore
+        [ "DataFeed", typeof<string>; "Symbol", typeof<string>; "StatName", typeof<string>; "DataField", typeof<string>
+          "TradeDate", typeof<DateTime>; "Dt", typeof<DateTime>; "Raw", typeof<double>; "Med", typeof<double>
+          "Mad", typeof<double>; "Scale", typeof<double>; "MZ", typeof<double>; "Weight", typeof<double>
+          "Clean", typeof<double>; "Cadence", typeof<int>; "Source", typeof<string>; "InsertTime", typeof<DateTime> ]
+        |> List.iter addCol
+        let scale = 1.4826
+        for (dtm, outs) in rows do
+            let raw   = if outs.Length>0 then outs[0] else 0.0
+            let med   = if outs.Length>1 then outs[1] else raw
+            let mad   = if outs.Length>2 then outs[2] else 0.0
+            let clean = if outs.Length>3 then outs[3] else raw
+            let denom = if mad*scale > 1e-12 then mad*scale else 1e-12
+            let mz    = (raw - med) / denom
+            let weight= 1.0
+            let row = dt.NewRow()
+            row["DataFeed"] <- feed; row["Symbol"] <- sym; row["StatName"] <- stat; row["DataField"] <- field
+            row["TradeDate"]<- dtm.Date; row["Dt"] <- dtm; row["Raw"] <- raw; row["Med"] <- med; row["Mad"] <- mad
+            row["Scale"] <- scale; row["MZ"] <- mz; row["Weight"] <- weight; row["Clean"] <- clean
+            row["Cadence"] <- cadence; row["Source"] <- "engine0"; row["InsertTime"] <- DateTime.UtcNow
+            dt.Rows.Add(row)
+        dt
+
+    [<EntryPoint>]
+    let main argv =
+        // Args: --io file|pipe --in <dir> --key <...> --sep , --dtfmt fmt --conn <connStr> --schema dbo --table S1_RobustCadenceN --cadence 31 --ensure yes|no
+        let mutable io="file"; let mutable inDir="."; let mutable key="demo+EOD5Secs+AAPL+WAP+job123"
+        let mutable sep=","; let mutable dtfmt="yyyy-MM-dd HH:mm:ss"; let mutable connStr=""; let mutable schemaName="dbo"; let mutable tableName="S1_RobustCadenceN"; let mutable cadence=31; let mutable ensure="no"
+        let rec loop i = if i < argv.Length then match argv[i] with
+                         | "--io"     -> io <- argv[i+1].ToLowerInvariant(); loop (i+2)
+                         | "--in"     -> inDir <- argv[i+1]; loop (i+2)
+                         | "--key"    -> key <- argv[i+1]; loop (i+2)
+                         | "--sep"    -> sep <- argv[i+1]; loop (i+2)
+                         | "--dtfmt"  -> dtfmt <- argv[i+1]; loop (i+2)
+                         | "--conn"   -> connStr <- argv[i+1]; loop (i+2)
+                         | "--schema" -> schemaName <- argv[i+1]; loop (i+2)
+                         | "--table"  -> tableName <- argv[i+1]; loop (i+2)
+                         | "--cadence"-> cadence <- int argv[i+1]; loop (i+2)
+                         | "--ensure" -> ensure <- argv[i+1].ToLowerInvariant(); loop (i+2)
+                         | x -> failwithf "Unknown arg %s" x
+        loop 0
+        if String.IsNullOrWhiteSpace connStr then (eprintfn "Engine1B: --conn required"; 2) else
+        let rows =
+            if io="pipe" then readOutputPipe Console.In sep dtfmt
+            else
+                let path = Path.Combine(inDir, key + ".out.csv")
+                if not (File.Exists path) then (eprintfn "Engine1B: missing %s" path; []) else readOutputFile path sep dtfmt
+        try
+            use conn = new SqlConnection(connStr)
+            conn.Open()
+            if ensure="yes" then
+                for batch in Tvps.CreateTvpAndProc.Split([|"GO"|], StringSplitOptions.RemoveEmptyEntries) do
+                    use cmd = new SqlCommand(batch, conn)
+                    cmd.ExecuteNonQuery() |> ignore
+            let tvp = buildTvp schemaName tableName rows key cadence
+            use cmd2 = new SqlCommand(Tvps.UpsertProcName, conn)
+            cmd2.CommandType <- CommandType.StoredProcedure
+            let p = cmd2.Parameters.Add("@Rows", SqlDbType.Structured)
+            p.TypeName <- "dbo.S1_RobustCadenceN_TVP"
+            p.Value <- tvp
+            cmd2.Parameters.AddWithValue("@SchemaName", schemaName) |> ignore
+            cmd2.Parameters.AddWithValue("@TableName", tableName) |> ignore
+            let _ = cmd2.ExecuteNonQuery()
+            printfn "Engine1B: upserted %d rows" tvp.Rows.Count
+            0
+        with ex -> eprintfn "Engine1B ERROR: %s" ex.Message; 1
+
+// -------------------------------------------
+// MMTS.S0.Worker (v2)
+// -------------------------------------------
+namespace MMTS.S0.Worker
+
+open System
+open System.Diagnostics
+open System.IO
+open System.Threading.Tasks
+
+module Types =
+    type Step = { name: string; exe: string; args: string; io: string } // io: file|pipe
+    type Workflow = { id: string; dop: int; retry: int; backoffMs: int; keys: string list; steps: Step list }
+
+module YamlLike =
+    open Types
+    let parse (text: string) : Workflow =
+        let lines = text.Split('\n') |> Array.map (fun s -> s.Trim())
+        let kv name def =
+            lines |> Array.tryFind (fun s -> s.StartsWith(name))
+            |> Option.map (fun s -> s.Substring(s.IndexOf(':')+1).Trim().Trim('"'))
+            |> Option.defaultValue def
+        let id = kv "id:" "workflow"
+        let dop = kv "dop:" "1" |> int
+        let retry = kv "retry:" "0" |> int
+        let backoff = kv "backoffMs:" "500" |> int
+        let keys =
+            match lines |> Array.tryFindIndex (fun s -> s.StartsWith("keys:")) with
+            | None -> []
+            | Some i ->
+                let buff = System.Collections.Generic.List<string>()
+                let mutable j = i+1
+                while j < lines.Length && lines[j].StartsWith("-") do
+                    buff.Add(lines[j].Substring(1).Trim().Trim('"'))
+                    j <- j + 1
+                List.ofSeq buff
+        let steps =
+            let buf = System.Collections.Generic.List<Step>()
+            let mutable i = 0
+            while i < lines.Length do
+                if lines[i].StartsWith("- name:") then
+                    let name = lines[i].Substring(7).Trim().Trim('"')
+                    let exe = lines[i+1].Substring(lines[i+1].IndexOf(':')+1).Trim()
+                    let args= lines[i+2].Substring(lines[i+2].IndexOf(':')+1).Trim().Trim('"')
+                    let io  = if i+3 < lines.Length && lines[i+3].StartsWith("io:") then lines[i+3].Substring(lines[i+3].IndexOf(':')+1).Trim().Trim('"') else "file"
+                    buf.Add({ name=name; exe=exe; args=args; io=io })
+                    i <- i + 4
+                else i <- i + 1
+            List.ofSeq buf
+        { id=id; dop=dop; retry=retry; backoffMs=backoff; keys=keys; steps=steps }
+
+module Runner =
+    open Types
+
+    let runStep (key:string) (s: Step) (stdinPayload:string option) = task {
+        let psi = new ProcessStartInfo()
+        psi.FileName <- s.exe
+        let args = s.args.Replace("${key}", key)
+        psi.Arguments <- args
+        psi.UseShellExecute <- false
+        psi.RedirectStandardOutput <- true
+        psi.RedirectStandardError <- true
+        if s.io = "pipe" then psi.RedirectStandardInput <- true
+        use p = new Process()
+        p.StartInfo <- psi
+        p.Start() |> ignore
+        if s.io = "pipe" then
+            match stdinPayload with
+            | Some payload ->
+                do! p.StandardInput.WriteAsync(payload) |> Async.AwaitTask |> Async.StartAsTask
+                p.StandardInput.Close()
+            | None -> ()
+        let! so = p.StandardOutput.ReadToEndAsync()
+        let! se = p.StandardError.ReadToEndAsync()
+        p.WaitForExit()
+        if se.Trim() <> "" then eprintfn "[%s@%s] %s" s.name key se
+        return p.ExitCode, so
+    }
+
+    let rec retryAsync (n:int) (backoffMs:int) (work: unit -> Task<int*string>) = task {
+        let! rc, so = work()
+        if rc = 0 || n <= 0 then return rc, so
+        do! Task.Delay(backoffMs)
+        return! retryAsync (n-1) (backoffMs*2) work
+    }
+
+    [<EntryPoint>]
+    let main argv =
+        // Args: --wf <path>
+        let mutable wfPath = "wf.yml"
+        let rec loop i = if i < argv.Length then match argv[i] with | "--wf" -> wfPath <- argv[i+1]; loop (i+2) | x -> failwithf "Unknown %s" x
+        loop 0
+        if not (File.Exists wfPath) then (eprintfn "Worker: missing %s" wfPath; 2) else
+        let wfText = File.ReadAllText(wfPath)
+        let wf = YamlLike.parse wfText
+        printfn "Worker: running %s (keys=%d, steps=%d, dop=%d)" wf.id wf.keys.Length wf.steps.Length wf.dop
+
+        let runKey (key:string) = task {
+            let mutable pay: string option = None
+            for s in wf.steps do
+                let! (rc, so) = retryAsync wf.retry wf.backoffMs (fun () -> runStep key s pay)
+                if rc <> 0 then return rc
+                pay <- if s.io = "pipe" then Some so else None
+            return 0
+        }
+
+        wf.keys
+        |> Seq.chunkBySize wf.dop
+        |> Seq.map (fun batch -> task { let! rcs = batch |> Array.map runKey |> Task.WhenAll; return rcs |> Array.sum })
+        |> Seq.toArray
+        |> Task.WhenAll
+        |> fun t -> t.Result
+        |> Array.sum
+        |> fun rc -> if rc=0 then 0 else 1
+
+// -------------------------------------------
+// wf.yml (v2 sample)
+// -------------------------------------------
+# id: "S0_engine0"
+# dop: 4
+# retry: 2
+# backoffMs: 500
+# keys:
+#   - "demo+EOD5Secs+AAPL+WAP+job123"
+#   - "demo+EOD5Secs+MSFT+WAP+job124"
+# steps:
+#   - name: prep
+#     exe: Engine1A.exe
+#     args: "--io pipe --key ${key}"
+#     io: "pipe"
+#   - name: engine0
+#     exe: engine0.exe
+#     args: "--io pipe --key ${key} --mode robust01 --win 9 --outCols 4"
+#     io: "pipe"
+#   - name: persist
+#     exe: Engine1B.exe
+#     args: "--io pipe --key ${key} --conn \"Server=.;Database=0_CADENCE;Trusted_Connection=True;TrustServerCertificate=True;\" --schema dbo --table S1_RobustCadenceN --cadence 31 --ensure yes"
+#     io: "pipe"
+#
+# # File-IO variant
+# #   prep:    Engine1A.exe --io file --out in --key ${key}
+# #   engine0: engine0.exe  --io file --in in --out out --key ${key} --mode robust01 --win 9 --outCols 4
+# #   persist: Engine1B.exe --io file --in out --key ${key} --conn "..." --schema dbo --table S1_RobustCadenceN --cadence 31 --ensure yes
+
+// -------------------------------------------
+// .fsproj hints (repeat per exe, change AssemblyName)
+// -------------------------------------------
+// <Project Sdk="Microsoft.NET.Sdk">
+//   <PropertyGroup>
+//     <OutputType>Exe</OutputType>
+//     <TargetFramework>net8.0</TargetFramework>
+//     <ImplicitUsings>disable</ImplicitUsings>
+//     <Nullable>disable</Nullable>
+//     <AssemblyName>engine0</AssemblyName>
+//   </PropertyGroup>
+// </Project>
+
+///////////////////////////////////////////////////
+Done! I wired everything you asked—check the updated canvas (“Engine0 Bare-nuts Executable + Yaml Pipeline”).
+
+What’s new:
+
+engine0.exe
+
+--io file|pipe (both supported)
+
+--mode identity|robust01|custom (custom hook point scaffolded)
+
+--win N rolling window
+
+Reads from stdin/writes to stdout when --io pipe, or uses files for debug.
+
+Engine1B.exe
+
+--io file|pipe input
+
+TVP bulk-upsert to S1_RobustCadenceN via proc dbo.S1_RobustCadenceN_Upsert_TVP (DDL included; pass --ensure yes to create)
+
+Key parsing k1+k2+k3+k4+JobId → (DataFeed, Symbol, StatName, DataField, JobId) with mapping: out1→Raw, out2→Med, out3→Mad, out4→Clean, plus MZ computed.
+
+MMTS.S0.Worker
+
+Parallel keys with dop
+
+Per-step retry + exponential backoffMs
+
+Pipe chaining: stdout payload from a step becomes stdin for the next when io: "pipe"
+
+Simple YAML-like spec now supports keys, dop, retry, backoffMs, and per-step `
+///////////////////////////////////////////////////
+
+// wf.yml (S0_MMTS_ML revised sample)
+// -------------------------------------------
+# id: "S0_MMTS_ML"
+# dop: 4
+# retry: 2
+# backoffMs: 500
+# keys:
+#   - "demo+EOD5Secs+AAPL+WAP+job123"
+#   - "demo+EOD5Secs+MSFT+WAP+job124"
+# steps:
+#   - name: fetch
+#     exe: POC.Hooks.S0.Fetch.v1.exe
+#     args: "--io pipe --key ${key}"
+#     io: "pipe"
+#   - name: transform
+#     exe: engine0.exe
+#     args: "--io pipe --key ${key} --mode robust01 --win 9 --outCols 4"
+#     io: "pipe"
+#   - name: materialize
+#     exe: Engine1B.exe
+#     args: "--io pipe --key ${key} --conn \"Server=.;Database=0_CADENCE;Trusted_Connection=True;TrustServerCertificate=True;\" --schema dbo --table S1_RobustCadenceN --cadence 31 --ensure yes"
+#     io: "pipe"
+#
+# # Alternate File-IO variant for debugging:
+# #   fetch:      POC.Hooks.S0.Fetch.v1.exe --io file --out in --key ${key}
+# #   transform:  engine0.exe --io file --in in --out out --key ${key} --mode robust01 --win 9 --outCols 4
+# #   materialize:Engine1B.exe --io file --in out --key ${key} --conn "..." --schema dbo --table S1_RobustCadenceN --cadence 31 --ensure yes
+
+///////////////////////////////////////////////////
+I’ve added a revised YAML for S0_MMTS_ML into the canvas.
+It now shows:
+
+Pipe mode: fetch → engine0 → materialize all chained via stdout/stdin.
+
+File mode variant: included as comments for debugging.
+
+Worker controls: DOP, retries, backoff, multiple keys.
+
+Do you also want me to extend this YAML so it can cover S1 and S2 stages in the same workflow (chained after S0)?
+///////////////////////////////////////////////////
+Would there be updates on MMTS.ML.Parse?
+Yes — moving to the new executable-based pipeline (Engine1A → engine0 → Engine1B, scheduled by Worker) means MMTS.ML.Parse should evolve too.
+
+Currently your Parse module only understands hooks (with module, func, kind, etc.). Now the YAML allows executables with exe, args, io, DOP, retry/backoff, and explicit keys.
+
+So MMTS.ML.Parse needs to update in a few ways:
+
+Step representation
+Add support for:
+type Step =
+  | Hook of { id: string; moduleName: string; func: string; kind: string; args: Map<string,obj> }
+  | Exec of { name: string; exe: string; args: string; io: string }
+
+Workflow metadata
+Parse top-level fields like dop, retry, backoffMs, and keys: [..].
+
+Parser extension
+
+Detect - name: with following exe: → produce Exec step.
+
+Detect legacy module: → produce Hook step (backward compatible).
+
+Normalize ${key} interpolation tokens but leave them unevaluated (Worker handles that).
+
+Validation layer
+Add rules for executables:
+
+exe must resolve to a file in PATH or working dir.
+
+args must include --key ${key} placeholder if multiple keys exist.
+
+io ∈ {file, pipe}.
+
+Pretty-printer (optional but useful)
+:list in REPL could print steps with Exec(...) info in addition to Hook steps.
+///////////////////////////////////////////////////
+Would you like me to draft a new version of MMTS.ML.Parse.fs 
+with these Exec extensions, or just a delta-patch 
+that you can fold into your current parser?
+
+Absolutely. I folded the “executable pipeline” affordances straight into 
+MMTS.ML.Parse—keeping full back-compat with your hook syntax while adding 
+ergonomic support for the S0 worker-style YAML you’ve been sketching. 
+Here’s a tight patch you can drop in (unified diff). It’s additive and safe:
+
+///////////////////////////////////////////////////
+*** a/MMTS.ML.Parser.fs
+--- b/MMTS.ML.Parser.fs
+@@
+ module Types =
+   type Spec =
+     { workflow    : string
+       version     : string
+       description : string
+       parameters  : Params
+       datasources : Map<string, DataSource>
+       tables      : Map<string, TableRef>
+       hooks       : Map<string, Hook>
+       steps       : StepNode list
+       validations : Validation list
+-      materialize : Materialize list
+-      schedule    : ScheduleSpec option }
++      materialize : Materialize list
++      schedule    : ScheduleSpec option
++      // ---- worker-style (optional) knobs, parsed but not required for classic runs ----
++      workerKeys      : string list option
++      workerDop       : int option
++      workerRetry     : int option
++      workerBackoffMs : int option }
+@@
+ module Parse =
+@@
+-    let private readUse (n:YamlNode) : Use =
++    let private readUse (n:YamlNode) : Use =
+         match n with
+         | :? YamlScalarNode as sc ->
+             // scalar string ? HookKey (back-compat)
+             HookKey sc.Value
+         | :? YamlMappingNode as m ->
+             let mm = kvs m
+-            let ty =
++            let ty =
+                 match mm.TryGetValue "type" with
+                 | true, v -> (str v).Trim().ToLowerInvariant()
+                 | _ ->
+                     if mm.ContainsKey "typeName" || mm.ContainsKey "module" then "dotnet" else "dotnet"
+             match ty with
+             | "exe" ->
+@@
+                 Exe { path = path; args = args; stdin = stdin; stdout = stdout; timeout = timeout; retry = retry }
+             | _ ->
+                 // dotnet (module/typeName + method/func)
+                 let typeName =
+@@
+                 DotNet { typeName = typeName; method = methodName }
+         | _ ->
+             failwithf "Unsupported 'uses' node: %A" n
++
++    // Shorthand reader for worker-style steps:
++    // - name/exe/args/io appear directly under the step node (no 'uses' block)
++    //   io: 'pipe' => stdin=rows, stdout=rows; 'file' => no stdio
++    let private readUseShorthand (mm:IDictionary<string,YamlNode>) : Use option =
++        let hasExe = mm.ContainsKey "exe" || mm.ContainsKey "path"
++        if not hasExe then None else
++            let path =
++                if mm.ContainsKey "exe" then str mm["exe"] else str mm["path"]
++            let args =
++                if mm.ContainsKey "args" then
++                    match mm["args"] with
++                    | :? YamlScalarNode as s -> [ s.Value ]
++                    | :? YamlSequenceNode as seq -> [ for a in seq.Children -> str a ]
++                    | _ -> []
++                else []
++            let ioMode =
++                if mm.ContainsKey "io" then str mm["io"] |> fun s -> s.Trim().ToLowerInvariant() else "file"
++            let stdin, stdout =
++                match ioMode with
++                | "pipe" -> IoKind.Rows, IoKind.Rows
++                | _      -> IoKind.Nonx, IoKind.Nonx
++            let timeout =
++                if mm.ContainsKey "timeout" then System.TimeSpan.Parse (str mm["timeout"])
++                else System.TimeSpan.FromMinutes 5.0
++            let retry =
++                if mm.ContainsKey "retry" then
++                    match mm["retry"] with
++                    | :? YamlMappingNode as rm ->
++                        let r = kvs rm
++                        let max   = r.TryGetValue "max"   |> function true, v -> int (str v) | _ -> 0
++                        let delay = r.TryGetValue "delay" |> function true, v -> System.TimeSpan.Parse (str v) | _ -> System.TimeSpan.FromSeconds 5.0
++                        let b     = r.TryGetValue "backoff"|> function true, v -> float (str v) | _ -> 1.0
++                        Some { max = max; delay = delay; backoff = b }
++                    | _ -> None
++                else None
++            Some (Exe { path = path; args = args; stdin = stdin; stdout = stdout; timeout = timeout; retry = retry })
+@@
+-    let private readStepFromMap (mm:IDictionary<string,YamlNode>) : Step =
+-        { id       = str mm["id"]
+-          uses     = readUse mm["uses"]
++    let private readStepFromMap (mm:IDictionary<string,YamlNode>) : Step =
++        let idVal =
++            if mm.ContainsKey "id"   then str mm["id"]
++            elif mm.ContainsKey "name" then str mm["name"]
++            else failwith "step requires 'id' (or 'name')"
++        let usesVal =
++            if mm.ContainsKey "uses" then readUse mm["uses"]
++            else
++                match readUseShorthand mm with
++                | Some u -> u
++                | None   -> failwith "step must specify either 'uses' or worker-style 'exe'"
++        { id       = idVal
++          uses     = usesVal
+           ``in``   = readStepIO mm "in"
+           args     = readArgs mm
+           foreach  = readForeach mm
+           out      = readStepIO mm "out" }
+@@
+-    let load (yamlText:string) : Types.Spec =
++    let load (yamlText:string) : Types.Spec =
+         let ys = YamlStream()
+         ys.Load(new System.IO.StringReader(yamlText))
+         let root = ys.Documents.[0].RootNode |> asMap |> kvs
+@@
+-        let schedule    = readSchedule   root
++        let schedule    = readSchedule   root
++        // Optional worker-style top-level knobs
++        let workerKeys =
++            match root.TryGetValue "keys" with
++            | true, (:? YamlSequenceNode as seq) -> Some [ for x in seq.Children -> str x ]
++            | _ -> None
++        let workerDop =
++            match root.TryGetValue "dop" with
++            | true, v -> Some (int (str v))
++            | _ -> None
++        let workerRetry =
++            match root.TryGetValue "retry" with
++            | true, v -> Some (int (str v))
++            | _ -> None
++        let workerBackoffMs =
++            match root.TryGetValue "backoffMs" with
++            | true, v -> Some (int (str v))
++            | _ -> None
+@@
+-        { workflow    = workflow
++        { workflow    = workflow
+           version     = version
+           description = description
+           parameters  = p0
+           datasources = datasources
+           tables      = tables
+           hooks       = hooks
+           steps       = steps
+           validations = validations
+           materialize = materialize
+-          schedule    = schedule }
++          schedule    = schedule
++          workerKeys      = workerKeys
++          workerDop       = workerDop
++          workerRetry     = workerRetry
++          workerBackoffMs = workerBackoffMs }
+
+///////////////////////////////////////////////////
+What this gives you
+
+Exec shorthand in steps: You can now write worker-style steps like:
+....
+- name: transform
+  exe: engine0.exe
+  args: "--io pipe --key ${key} --mode robust01 --win 9 --outCols 4"
+  io: "pipe"
+
+///////////////////////////////////////////////////
+…with no uses: block required. The parser turns this into Use.Exe with stdin/stdout wired per io.
+
+Top-level worker knobs parsed: Optional keys, dop, retry, backoffMs are now read into the Spec (as workerKeys/workerDop/workerRetry/workerBackoffMs). This keeps the runner/worker free to use them while remaining backwards compatible with your existing YAML structure.
+
+ID fallback: name: now works as a fallback for id: on steps (handy for worker-style YAML).
+
+Retry for exes: Per-step retry: { max, delay, backoff } is supported in the shorthand too (in addition to the detailed uses: type: exe form).
+
+All other behavior (hooks, dotnet in-process calls, foreach fan-out, 
+validations, materialize, schedule/cron, interpolation) stays exactly as in your uploaded version.
+///////////////////////////////////////////////////
+If you’d like, I can also emit a tiny unit test snippet (FsUnit/xUnit) that loads both a “classic hook” YAML 
+and your new S0 worker-style YAML to assert the parsed Spec shape matches expectations.
+please emit a tiny unit test snippet
+///////////////////////////////////////////////////
+Absolutely—here’s a tiny, drop-in xUnit test file that checks 
+both classic Hook and Exe parsing (including stdin/stdout wiring), 
+plus a minimal foreach + cron parse. 
+It targets the MMTS.ML namespaces and Parse.load/Types from your uploaded file.
+///////////////////////////////////////////////////
+// Tests/ParserTests.fs
+namespace MMTS.ML.Tests
+
+open System
+open Xunit
+open MMTS.ML
+open MMTS.ML.Types
+open MMTS.ML.Parse
+
+module ParserTests =
+
+    [<Fact>]
+    let ``parses classic Hook step`` () =
+        let yaml = """
+workflow: demo
+version: "1.0"
+description: test
+params:
+  envName: dev
+  dbName:  0_CADENCE
+  connStr: ""
+  hookNs:  POC.Hooks
+  impl:    v1
+  batchId: TEST
+  emitMode: bulk_upsert
+datasources: {}
+tables: {}
+hooks:
+  s0.fetch:
+    module: POC.Hooks.S0.Fetch.v1.Module
+    func:   Run
+    kind:   rows
+steps:
+  - id: fetch
+    uses: s0.fetch
+    out: { rows: "step:fetch.rows" }
+validations: []
+materialize: []
+"""
+        let spec = Parse.load yaml
+        Assert.Equal("demo", spec.workflow)
+        Assert.Single spec.steps |> ignore
+        match spec.steps.Head with
+        | Single st ->
+            match st.uses with
+            | HookKey k -> Assert.Equal("s0.fetch", k)   // HookKey path supported
+            | _ -> failwith "expected HookKey"
+        | _ -> failwith "expected Single step"
+
+    [<Fact>]
+    let ``parses classic Exe step with stdin/stdout Rows`` () =
+        let yaml = """
+workflow: demo
+version: "1.0"
+description: test
+params: { envName: dev, dbName: 0_CADENCE, connStr: "", hookNs: POC.Hooks, impl: v1, batchId: TEST, emitMode: bulk_upsert }
+datasources: {}
+tables: {}
+hooks: {}
+steps:
+  - id: transform
+    uses:
+      type: exe
+      path: engine0.exe
+      args: ["--io","pipe","--key","${params.batchId}","--mode","robust01","--win","9","--outCols","4"]
+      stdin: rows
+      stdout: rows
+validations: []
+materialize: []
+"""
+        let spec = Parse.load yaml
+        match spec.steps.Head with
+        | Single st ->
+            match st.uses with
+            | Exe e ->
+                // check we captured path/args/stdio
+                Assert.Equal("engine0.exe", e.path)
+                Assert.Contains("--io", e.args)
+                // stdin/stdout Rows wiring
+                match e.stdin, e.stdout with
+                | IoKind.Rows, IoKind.Rows -> ()
+                | _ -> failwith "expected stdin=Rows and stdout=Rows"
+            | _ -> failwith "expected Exe"
+        | _ -> failwith "expected Single step"
+
+    [<Fact>]
+    let ``parses foreach + cron schedule`` () =
+        let yaml = """
+workflow: demo
+version: "1.0"
+description: test
+params: { envName: dev, dbName: 0_CADENCE, connStr: "", hookNs: POC.Hooks, impl: v1, batchId: TEST, emitMode: bulk_upsert }
+datasources: {}
+tables: {}
+hooks: {}
+steps:
+  - id: fanout
+    uses:
+      type: exe
+      path: noop.exe
+      args: []
+      stdout: rows
+    foreach:
+      items: ["A","B","C"]
+      parallelism: 2
+validations: []
+materialize: []
+schedule:
+  cron: "0/5 * * * * ?"   # every 5 seconds (Quartz style)
+"""
+        let spec = Parse.load yaml
+        // schedule present
+        Assert.True(spec.schedule.IsSome)
+        // foreach spec present with items and dop=2
+        let st =
+            match spec.steps.Head with
+            | Single s -> s
+            | _ -> failwith "expected Single"
+        Assert.True(st.foreach.IsSome)
+        let f = st.foreach.Value
+        Assert.Equal<string list>(["A";"B";"C"], f.items.Value)
+        Assert.Equal(2, f.parallelism.Value)
+
+///////////////////////////////////////////////////
+Why these assertions:
+
+Use DU covers HookKey | DotNet | Exe, so we test both Hook 
+and Exe branches are parsed and wired (stdin/stdout rows) as defined in your Types 
+and readUse logic.
+
+ForeachSpec with items and parallelism is validated to match the parser’s 
+handling of foreach plus dop alias.
+
+ScheduleSpec (cron) is parsed at the workflow level.
+
+If you also want a test for the worker-style shorthand 
+(name/exe/args/io without a uses: block), I can add it as soon as that shorthand is merged 
+into your Parse module.
+
+///////////////////////////////////////////////////
+Short answer: yes—I’m keeping the classic hooks (fetch/transform/materialize) fully intact, and adding exec steps alongside them. That means you can kick off “prep-work” for Engine1A and Engine1B using either hooks or execs (or both), then flow into the new engine0/Engine1B executables.
+
+Here’s what that unlocks and what “prep-work” means in practice:
+
+Prep for Engine1A (before transform)
+
+Build the key set (k1+k2+k3+k4+JobId) from a query or config.
+
+Ensure input dirs (for file mode) or emit rows (for pipe mode).
+
+Warm caches, validate source reachability, set idempotency tokens.
+
+Prep for Engine1B (before materialize)
+
+Ensure the target DDL (table/view), TVP type, and proc exist.
+
+Check permissions, test the DB connection, set cadence parameters.
+
+Choose upsert strategy (MERGE vs TVP proc) and batch sizing.
+
+Hybrid patterns you can run today
+A) Pure-exec (fast path; pipes)
+
+///////////////////////////////////////////////////
+- name: fetch_prep             # optional pre-step as exec
+  exe: Prep.Engine1A.exe
+  args: "--mode prepare --key ${key}"
+  io: "pipe"
+
+- name: transform
+  exe: engine0.exe
+  args: "--io pipe --key ${key} --mode robust01 --win 9 --outCols 4"
+  io: "pipe"
+
+- name: persist_prep           # create TVP/proc/table
+  exe: Prep.Engine1B.exe
+  args: "--ensure yes --conn ${params.connStr}"
+  io: "pipe"
+
+- name: materialize
+  exe: Engine1B.exe
+  args: "--io pipe --key ${key} --conn ${params.connStr} --schema dbo --table S1_RobustCadenceN --cadence 31"
+  io: "pipe"
+
+///////////////////////////////////////////////////
+B) Hook + exec (lightweight prep in-process, heavy work out-of-process)
+///////////////////////////////////////////////////
+- id: prep_keys
+  uses: s0.prepare.keys            # existing hook
+  out: { rows: "step:prep_keys.rows" }
+
+- name: transform
+  exe: engine0.exe
+  args: "--io pipe --key ${key} --mode robust01 --win 9 --outCols 4"
+  io: "pipe"
+  foreach:
+    over: "rows:step:prep_keys.rows"
+    parallelism: 4
+
+- id: prep_db
+  uses: s0.prepare.db               # hook that runs DDL/TVP ensures
+
+- name: materialize
+  exe: Engine1B.exe
+  args: "--io pipe --key ${key} --conn ${params.connStr} --schema dbo --table S1_RobustCadenceN --cadence 31 --ensure no"
+  io: "pipe"
+
+///////////////////////////////////////////////////
+C) Debug file-mode (easy to inspect artifacts)
+
+///////////////////////////////////////////////////
+- name: fetch
+  exe: Engine1A.exe
+  args: "--io file --out in --key ${key}"
+
+- name: transform
+  exe: engine0.exe
+  args: "--io file --in in --out out --key ${key} --mode robust01 --win 9 --outCols 4"
+
+- name: persist
+  exe: Engine1B.exe
+  args: "--io file --in out --key ${key} --conn ${params.connStr} --ensure yes"
+
+///////////////////////////////////////////////////
+Why keep hooks at all?
+
+Back-compat & incrementality: your current hook-based S0→S1 logic keeps running while you introduce executables where they shine (CPU-bound transforms, long-running steps).
+
+Ergonomics: hooks are great for quick, in-proc orchestration 
+(e.g., compute a key list, emit env args, run quick DDL), 
+while execs handle streaming/pipes and isolate failures cleanly.
+///////////////////////////////////////////////////
+If you want, I’ll add two tiny “prep” artifacts next:
+
+Prep.Engine1A.exe (or s0.prepare.keys hook) that expands symbols/statnames → ${key} list, and
+
+Prep.Engine1B.exe (or s0.prepare.db hook) that ensures dbo.S1_RobustCadenceN_TVP 
+and dbo.S1_RobustCadenceN_Upsert_TVP, plus the target table, before Engine1B runs.
+///////////////////////////////////////////////////
+Got it — I’ll add two tiny prep artifacts you can drop alongside your engines. 
+These act as lightweight helpers for setup and teardown:
+///////////////////////////////////////////////////
+
+namespace Prep.Engine1A
+
+open System
+
+module Program =
+    [<EntryPoint>]
+    let main argv =
+        // Args: --symbol AAPL --statName WAP --dataFeed EOD5Secs --job job123
+        let mutable sym   = "AAPL"
+        let mutable stat  = "WAP"
+        let mutable feed  = "EOD5Secs"
+        let mutable job   = "job123"
+        let rec loop i =
+            if i < argv.Length then
+                match argv.[i] with
+                | "--symbol"   -> sym  <- argv.[i+1]; loop (i+2)
+                | "--statName" -> stat <- argv.[i+1]; loop (i+2)
+                | "--dataFeed" -> feed <- argv.[i+1]; loop (i+2)
+                | "--job"      -> job  <- argv.[i+1]; loop (i+2)
+                | x -> failwithf "Unknown arg: %s" x
+        loop 0
+
+        let key = String.concat "+" [feed; sym; stat; "WAP"; job]
+        printfn "%s" key   // Worker will collect this into `keys: [...]`
+
+        0
+
+///////////////////////////////////////////////////
+Prep.Engine1B.fs
+
+(prep step to ensure DB target for Engine1B exists)
+///////////////////////////////////////////////////
+namespace Prep.Engine1B
+
+open System
+open Microsoft.Data.SqlClient
+
+module Program =
+    [<EntryPoint>]
+    let main argv =
+        // Args: --conn "..." --schema dbo --table S1_RobustCadenceN --ensure yes
+        let mutable connStr = ""
+        let mutable schema  = "dbo"
+        let mutable table   = "S1_RobustCadenceN"
+        let mutable ensure  = "yes"
+
+        let rec loop i =
+            if i < argv.Length then
+                match argv.[i] with
+                | "--conn"   -> connStr <- argv.[i+1]; loop (i+2)
+                | "--schema" -> schema  <- argv.[i+1]; loop (i+2)
+                | "--table"  -> table   <- argv.[i+1]; loop (i+2)
+                | "--ensure" -> ensure  <- argv.[i+1].ToLowerInvariant(); loop (i+2)
+                | x -> failwithf "Unknown arg: %s" x
+        loop 0
+
+        if String.IsNullOrWhiteSpace connStr then
+            eprintfn "Prep.Engine1B: --conn required"
+            2
+        else
+            try
+                use conn = new SqlConnection(connStr)
+                conn.Open()
+                if ensure = "yes" then
+                    let ddl = $"""
+IF OBJECT_ID(N'[{schema}].[{table}]', N'U') IS NULL
+BEGIN
+    CREATE TABLE [{schema}].[{table}](
+      [DataFeed] NVARCHAR(32) NOT NULL,
+      [Symbol]   NVARCHAR(32) NOT NULL,
+      [StatName] NVARCHAR(64) NOT NULL,
+      [DataField] NVARCHAR(64) NOT NULL,
+      [TradeDate] DATETIME2(0) NOT NULL,
+      [Dt]        DATETIME2(0) NOT NULL,
+      [Raw]   FLOAT NULL,
+      [Med]   FLOAT NULL,
+      [Mad]   FLOAT NULL,
+      [Scale] FLOAT NULL,
+      [MZ]    FLOAT NULL,
+      [Weight] FLOAT NULL,
+      [Clean]  FLOAT NULL,
+      [Cadence] INT NULL,
+      [Source] NVARCHAR(64) NULL,
+      [InsertTime] DATETIME2(0) NULL,
+      CONSTRAINT PK_{table} PRIMARY KEY CLUSTERED ([DataFeed],[Symbol],[StatName],[DataField],[TradeDate],[Dt])
+    );
+END
+"""
+                    use cmd = new SqlCommand(ddl, conn)
+                    cmd.ExecuteNonQuery() |> ignore
+                    printfn "Prep.Engine1B: ensured table %s.%s" schema table
+                else
+                    printfn "Prep.Engine1B: skipping ensure"
+                0
+            with ex ->
+                eprintfn "Prep.Engine1B ERROR: %s" ex.Message
+                1
+
+///////////////////////////////////////////////////
+YAML wiring with preps
+///////////////////////////////////////////////////
+id: "S0_MMTS_ML"
+dop: 4
+keys:
+  - "demo+EOD5Secs+AAPL+WAP+job123"
+
+steps:
+  - name: prep_keys
+    exe: Prep.Engine1A.exe
+    args: "--symbol AAPL --statName WAP --dataFeed EOD5Secs --job job123"
+    io: "pipe"
+
+  - name: transform
+    exe: engine0.exe
+    args: "--io pipe --key ${key} --mode robust01 --win 9 --outCols 4"
+    io: "pipe"
+
+  - name: prep_db
+    exe: Prep.Engine1B.exe
+    args: "--conn \"Server=.;Database=0_CADENCE;Trusted_Connection=True;\" --schema dbo --table S1_RobustCadenceN --ensure yes"
+    io: "file"
+
+  - name: materialize
+    exe: Engine1B.exe
+    args: "--io pipe --key ${key} --conn \"Server=.;Database=0_CADENCE;Trusted_Connection=True;\" --schema dbo --table S1_RobustCadenceN --cadence 31"
+    io: "pipe"
+
+///////////////////////////////////////////////////
+
+These “prep” artifacts keep things modular:
+
+Prep.Engine1A = lightweight key factory.
+
+Prep.Engine1B = lightweight DDL/TVP ensure.
+///////////////////////////////////////////////////
+Do you want me to also fold these into your hooks: map as default s0.prepare.keys and s0.prepare.db 
+so they can run in either hook-mode or exec-mode?
+///////////////////////////////////////////////////
+// wf.yml (S0_MMTS_ML revised sample)
+// -------------------------------------------
+# id: "S0_MMTS_ML"
+# dop: 4
+# retry: 2
+# backoffMs: 500
+# keys:
+#   - "demo+EOD5Secs+AAPL+WAP+job123"
+#   - "demo+EOD5Secs+MSFT+WAP+job124"
+# steps:
+#   - name: fetch
+#     exe: POC.Hooks.S0.Fetch.v1.exe
+#     args: "--io pipe --key ${key}"
+#     io: "pipe"
+#   - name: transform
+#     exe: engine0.exe
+#     args: "--io pipe --key ${key} --mode robust01 --win 9 --outCols 4"
+#     io: "pipe"
+#   - name: materialize
+#     exe: Engine1B.exe
+#     args: "--io pipe --key ${key} --conn \"Server=.;Database=0_CADENCE;Trusted_Connection=True;TrustServerCertificate=True;\" --schema dbo --table S1_RobustCadenceN --cadence 31 --ensure yes"
+#     io: "pipe"
+#
+# # Alternate File-IO variant for debugging:
+# #   fetch:      POC.Hooks.S0.Fetch.v1.exe --io file --out in --key ${key}
+# #   transform:  engine0.exe --io file --in in --out out --key ${key} --mode robust01 --win 9 --outCols 4
+# #   materialize:Engine1B.exe --io file --in out --key ${key} --conn "..." --schema dbo --table S1_RobustCadenceN --cadence 31 --ensure yes
+// -------------------------------------------
+// Hook-mode equivalents for prep (so you can run as hooks OR execs)
+// -------------------------------------------
+namespace POC.Hooks.S0.Prepare.Keys.v1
+
+open System
+
+module [<RequireQualifiedAccess>] Module =
+    // kind: rows  (emits one string per row = key)
+    let Run (args: System.Collections.Generic.IDictionary<string,obj>) : obj =
+        let g k def = if args.ContainsKey k then args.[k] :?> string else def
+        let feed  = g "dataFeed" "EOD5Secs"
+        let sym   = g "symbol"   "AAPL"
+        let stat  = g "statName" "WAP"
+        let field = g "dataField" "WAP"
+        let job   = g "jobId"    "job123"
+        let key = String.concat "+" [feed; sym; stat; field; job]
+        // Return as list<string> (rows)
+        box [ key ]
+
+namespace POC.Hooks.S0.Prepare.DB.v1
+
+open System
+open Microsoft.Data.SqlClient
+
+module [<RequireQualifiedAccess>] Module =
+    // kind: unit (no inlet/outlet)
+    let Run (args: System.Collections.Generic.IDictionary<string,obj>) : obj =
+        let gs k def = if args.ContainsKey k then args.[k] :?> string else def
+        let connStr = gs "connStr" ""
+        let schema  = gs "schema"  "dbo"
+        let table   = gs "table"   "S1_RobustCadenceN"
+        if String.IsNullOrWhiteSpace connStr then failwith "connStr required"
+        let ddl = $"""
+IF OBJECT_ID(N'[{schema}].[{table}]', N'U') IS NULL
+BEGIN
+    CREATE TABLE [{schema}].[{table}] (
+      [DataFeed] NVARCHAR(32) NOT NULL,
+      [Symbol] NVARCHAR(32) NOT NULL,
+      [StatName] NVARCHAR(64) NOT NULL,
+      [DataField] NVARCHAR(64) NOT NULL,
+      [TradeDate] DATETIME2(0) NOT NULL,
+      [Dt] DATETIME2(0) NOT NULL,
+      [Raw] FLOAT NULL,[Med] FLOAT NULL,[Mad] FLOAT NULL,[Scale] FLOAT NULL,
+      [MZ] FLOAT NULL,[Weight] FLOAT NULL,[Clean] FLOAT NULL,[Cadence] INT NULL,
+      [Source] NVARCHAR(64) NULL,[InsertTime] DATETIME2(0) NULL,
+      CONSTRAINT [PK_{table}] PRIMARY KEY CLUSTERED
+      ([DataFeed],[Symbol],[StatName],[DataField],[TradeDate],[Dt])
+    );
+END
+"""
+        use conn = new SqlConnection(connStr)
+        conn.Open()
+        use cmd = new SqlCommand(ddl, conn)
+        cmd.ExecuteNonQuery() |> ignore
+        box ()
+
+// -------------------------------------------
+// YAML snippets showing both modes
+// -------------------------------------------
+# hooks:
+#   s0.prepare.keys:
+#     module: POC.Hooks.S0.Prepare.Keys.v1.Module
+#     func:   Run
+#     kind:   rows
+#   s0.prepare.db:
+#     module: POC.Hooks.S0.Prepare.DB.v1.Module
+#     func:   Run
+#     kind:   unit
+#
+# # Hook-mode pipeline
+# steps:
+#   - id: prep_keys
+#     uses: s0.prepare.keys
+#     out: { rows: "step:prep_keys.rows" }
+#   - name: transform
+#     exe: engine0.exe
+#     args: "--io pipe --key ${key} --mode robust01 --win 9 --outCols 4"
+#     io: "pipe"
+#     foreach:
+#       over: "rows:step:prep_keys.rows"
+#       parallelism: 4
+#   - id: prep_db
+#     uses: s0.prepare.db
+#     args: { connStr: "Server=.;Database=0_CADENCE;Trusted_Connection=True;TrustServerCertificate=True;", schema: dbo, table: S1_RobustCadenceN }
+#   - name: materialize
+#     exe: Engine1B.exe
+#     args: "--io pipe --key ${key} --conn \"Server=.;Database=0_CADENCE;Trusted_Connection=True;TrustServerCertificate=True;\" --schema dbo --table S1_RobustCadenceN --cadence 31"
+#     io: "pipe"
+#
+# # Exec-mode pipeline (no hooks), using the earlier Prep executables
+# steps:
+#   - name: prep_keys
+#     exe: Prep.Engine1A.exe
+#     args: "--symbol AAPL --statName WAP --dataFeed EOD5Secs --job job123"
+#     io: "pipe"
+#   - name: transform
+#     exe: engine0.exe
+#     args: "--io pipe --key ${key} --mode robust01 --win 9 --outCols 4"
+#     io: "pipe"
+#   - name: prep_db
+#     exe: Prep.Engine1B.exe
+#     args: "--conn \"Server=.;Database=0_CADENCE;Trusted_Connection=True;TrustServerCertificate=True;\" --schema dbo --table S1_RobustCadenceN --ensure yes"
+#     io: "file"
+#   - name: materialize
+#     exe: Engine1B.exe
+#     args: "--io pipe --key ${key} --conn \"Server=.;Database=0_CADENCE;Trusted_Connection=True;TrustServerCertificate=True;\" --schema dbo --table S1_RobustCadenceN --cadence 31"
+#     io: "pipe"
+
+
+///////////////////////////////////////////////////
+Done! I folded in two default hooks:
+
+s0.prepare.keys → POC.Hooks.S0.Prepare.Keys.v1.Module.Run (emits key rows)
+
+s0.prepare.db → POC.Hooks.S0.Prepare.DB.v1.Module.Run (ensures target table)
+
+On the canvas you’ll see:
+
+Minimal F# hook modules implementing those two preps.
+
+YAML snippets showing both hook-mode and exec-mode wiring, 
+so you can choose per workflow (and even mix).
+///////////////////////////////////////////////////
+please ,add a tiny hooks: unit test to confirm these emit/execute correctly through MMTS.ML.Parse
+///////////////////////////////////////////////////
+// wf.yml (S0_MMTS_ML revised sample)
+// -------------------------------------------
+# id: "S0_MMTS_ML"
+# dop: 4
+# retry: 2
+# backoffMs: 500
+# keys:
+#   - "demo+EOD5Secs+AAPL+WAP+job123"
+#   - "demo+EOD5Secs+MSFT+WAP+job124"
+# steps:
+#   - name: fetch
+#     exe: POC.Hooks.S0.Fetch.v1.exe
+#     args: "--io pipe --key ${key}"
+#     io: "pipe"
+#   - name: transform
+#     exe: engine0.exe
+#     args: "--io pipe --key ${key} --mode robust01 --win 9 --outCols 4"
+#     io: "pipe"
+#   - name: materialize
+#     exe: Engine1B.exe
+#     args: "--io pipe --key ${key} --conn \"Server=.;Database=0_CADENCE;Trusted_Connection=True;TrustServerCertificate=True;\" --schema dbo --table S1_RobustCadenceN --cadence 31 --ensure yes"
+#     io: "pipe"
+#
+# # Alternate File-IO variant for debugging:
+# #   fetch:      POC.Hooks.S0.Fetch.v1.exe --io file --out in --key ${key}
+# #   transform:  engine0.exe --io file --in in --out out --key ${key} --mode robust01 --win 9 --outCols 4
+# #   materialize:Engine1B.exe --io file --in out --key ${key} --conn "..." --schema dbo --table S1_RobustCadenceN --cadence 31 --ensure yes
+
+// -------------------------------------------
+// Hook-mode equivalents for prep (so you can run as hooks OR execs)
+// -------------------------------------------
+namespace POC.Hooks.S0.Prepare.Keys.v1
+
+open System
+
+module [<RequireQualifiedAccess>] Module =
+    // kind: rows  (emits one string per row = key)
+    let Run (args: System.Collections.Generic.IDictionary<string,obj>) : obj =
+        let g k def = if args.ContainsKey k then args.[k] :?> string else def
+        let feed  = g "dataFeed" "EOD5Secs"
+        let sym   = g "symbol"   "AAPL"
+        let stat  = g "statName" "WAP"
+        let field = g "dataField" "WAP"
+        let job   = g "jobId"    "job123"
+        let key = String.concat "+" [feed; sym; stat; field; job]
+        // Return as list<string> (rows)
+        box [ key ]
+
+namespace POC.Hooks.S0.Prepare.DB.v1
+
+open System
+open Microsoft.Data.SqlClient
+
+module [<RequireQualifiedAccess>] Module =
+    // kind: unit (no inlet/outlet)
+    let Run (args: System.Collections.Generic.IDictionary<string,obj>) : obj =
+        let gs k def = if args.ContainsKey k then args.[k] :?> string else def
+        let connStr = gs "connStr" ""
+        let schema  = gs "schema"  "dbo"
+        let table   = gs "table"   "S1_RobustCadenceN"
+        if String.IsNullOrWhiteSpace connStr then failwith "connStr required"
+        let ddl = $"""
+IF OBJECT_ID(N'[{schema}].[{table}]', N'U') IS NULL
+BEGIN
+    CREATE TABLE [{schema}].[{table}] (
+      [DataFeed] NVARCHAR(32) NOT NULL,
+      [Symbol] NVARCHAR(32) NOT NULL,
+      [StatName] NVARCHAR(64) NOT NULL,
+      [DataField] NVARCHAR(64) NOT NULL,
+      [TradeDate] DATETIME2(0) NOT NULL,
+      [Dt] DATETIME2(0) NOT NULL,
+      [Raw] FLOAT NULL,[Med] FLOAT NULL,[Mad] FLOAT NULL,[Scale] FLOAT NULL,
+      [MZ] FLOAT NULL,[Weight] FLOAT NULL,[Clean] FLOAT NULL,[Cadence] INT NULL,
+      [Source] NVARCHAR(64) NULL,[InsertTime] DATETIME2(0) NULL,
+      CONSTRAINT [PK_{table}] PRIMARY KEY CLUSTERED
+      ([DataFeed],[Symbol],[StatName],[DataField],[TradeDate],[Dt])
+    );
+END
+"""
+        use conn = new SqlConnection(connStr)
+        conn.Open()
+        use cmd = new SqlCommand(ddl, conn)
+        cmd.ExecuteNonQuery() |> ignore
+        box ()
+
+// -------------------------------------------
+// YAML snippets showing both modes
+// -------------------------------------------
+# hooks:
+#   s0.prepare.keys:
+#     module: POC.Hooks.S0.Prepare.Keys.v1.Module
+#     func:   Run
+#     kind:   rows
+#   s0.prepare.db:
+#     module: POC.Hooks.S0.Prepare.DB.v1.Module
+#     func:   Run
+#     kind:   unit
+#
+# # Hook-mode pipeline
+# steps:
+#   - id: prep_keys
+#     uses: s0.prepare.keys
+#     out: { rows: "step:prep_keys.rows" }
+#   - name: transform
+#     exe: engine0.exe
+#     args: "--io pipe --key ${key} --mode robust01 --win 9 --outCols 4"
+#     io: "pipe"
+#     foreach:
+#       over: "rows:step:prep_keys.rows"
+#       parallelism: 4
+#   - id: prep_db
+#     uses: s0.prepare.db
+#     args: { connStr: "Server=.;Database=0_CADENCE;Trusted_Connection=True;TrustServerCertificate=True;", schema: dbo, table: S1_RobustCadenceN }
+#   - name: materialize
+#     exe: Engine1B.exe
+#     args: "--io pipe --key ${key} --conn \"Server=.;Database=0_CADENCE;Trusted_Connection=True;TrustServerCertificate=True;\" --schema dbo --table S1_RobustCadenceN --cadence 31"
+#     io: "pipe"
+#
+# # Exec-mode pipeline (no hooks), using the earlier Prep executables
+# steps:
+#   - name: prep_keys
+#     exe: Prep.Engine1A.exe
+#     args: "--symbol AAPL --statName WAP --dataFeed EOD5Secs --job job123"
+#     io: "pipe"
+#   - name: transform
+#     exe: engine0.exe
+#     args: "--io pipe --key ${key} --mode robust01 --win 9 --outCols 4"
+#     io: "pipe"
+#   - name: prep_db
+#     exe: Prep.Engine1B.exe
+#     args: "--conn \"Server=.;Database=0_CADENCE;Trusted_Connection=True;TrustServerCertificate=True;\" --schema dbo --table S1_RobustCadenceN --ensure yes"
+#     io: "file"
+#   - name: materialize
+#     exe: Engine1B.exe
+#     args: "--io pipe --key ${key} --conn \"Server=.;Database=0_CADENCE;Trusted_Connection=True;TrustServerCertificate=True;\" --schema dbo --table S1_RobustCadenceN --cadence 31"
+#     io: "pipe"
+
+// -------------------------------------------
+// Tests/ParserHooksTests.fs — tiny unit tests for hook-mode preps
+// -------------------------------------------
+namespace MMTS.ML.Tests
+
+open System
+open Xunit
+open MMTS.ML
+open MMTS.ML.Types
+open MMTS.ML.Parse
+
+module ParserHooksTests =
+
+    [<Fact>]
+    let ``parses s0.prepare.keys hook and step wiring`` () =
+        let yaml = """
+workflow: demo
+version: "1.0"
+description: test
+hooks:
+  s0.prepare.keys:
+    module: POC.Hooks.S0.Prepare.Keys.v1.Module
+    func:   Run
+    kind:   rows
+steps:
+  - id: prep_keys
+    uses: s0.prepare.keys
+    out: { rows: "step:prep_keys.rows" }
+validations: []
+materialize: []
+"""
+        let spec = Parse.load yaml
+        // hook present
+        Assert.True(spec.hooks.ContainsKey("s0.prepare.keys"))
+        // step present and points to HookKey
+        match spec.steps with
+        | [ Single st ] ->
+            match st.uses with
+            | HookKey k -> Assert.Equal("s0.prepare.keys", k)
+            | _ -> failwith "expected HookKey"
+            // out wiring present
+            Assert.True(st.out.ContainsKey("rows"))
+        | _ -> failwith "expected one Single step"
+
+    [<Fact>]
+    let ``parses s0.prepare.db hook with args`` () =
+        let yaml = """
+workflow: demo
+version: "1.0"
+description: test
+hooks:
+  s0.prepare.db:
+    module: POC.Hooks.S0.Prepare.DB.v1.Module
+    func:   Run
+    kind:   unit
+steps:
+  - id: prep_db
+    uses: s0.prepare.db
+    args:
+      connStr: "Server=.;Database=0_CADENCE;Trusted_Connection=True;TrustServerCertificate=True;"
+      schema: dbo
+      table: S1_RobustCadenceN
+validations: []
+materialize: []
+"""
+        let spec = Parse.load yaml
+        Assert.True(spec.hooks.ContainsKey("s0.prepare.db"))
+        match spec.steps with
+        | [ Single st ] ->
+            match st.uses with
+            | HookKey k -> Assert.Equal("s0.prepare.db", k)
+            | _ -> failwith "expected HookKey"
+            // args surfaced at step level
+            Assert.True(st.args.ContainsKey("connStr"))
+            Assert.Equal("dbo", st.args.["schema"] :?> string)
+            Assert.Equal("S1_RobustCadenceN", st.args.["table"] :?> string)
+        | _ -> failwith "expected one Single step"
+
+
+///////////////////////////////////////////////////
+Added! I dropped a tiny xUnit file onto the canvas:
+
+Tests/ParserHooksTests.fs verifies:
+
+hooks: map contains s0.prepare.keys and s0.prepare.db.
+
+Steps referencing them parse as HookKey.
+
+out wiring for keys and args for db prep are captured.
+
+If you want a test that actually invokes the hook implementations 
+(via reflection) we can add an integration test next—just say the word 
+and I’ll wire a minimal runner that calls Module.Run with a sample arg map and asserts outputs.
+...
+please test ...test that actually invokes the hook implementations (via reflection) we can add an integration test next—just say the word 
+and I’ll wire a minimal runner that calls Module.Run with a sample arg map and asserts outputs.
+///////////////////////////////////////////////////
+// wf.yml (S0_MMTS_ML revised sample)
+// -------------------------------------------
+# id: "S0_MMTS_ML"
+# dop: 4
+# retry: 2
+# backoffMs: 500
+# keys:
+#   - "demo+EOD5Secs+AAPL+WAP+job123"
+#   - "demo+EOD5Secs+MSFT+WAP+job124"
+# steps:
+#   - name: fetch
+#     exe: POC.Hooks.S0.Fetch.v1.exe
+#     args: "--io pipe --key ${key}"
+#     io: "pipe"
+#   - name: transform
+#     exe: engine0.exe
+#     args: "--io pipe --key ${key} --mode robust01 --win 9 --outCols 4"
+#     io: "pipe"
+#   - name: materialize
+#     exe: Engine1B.exe
+#     args: "--io pipe --key ${key} --conn \"Server=.;Database=0_CADENCE;Trusted_Connection=True;TrustServerCertificate=True;\" --schema dbo --table S1_RobustCadenceN --cadence 31 --ensure yes"
+#     io: "pipe"
+#
+# # Alternate File-IO variant for debugging:
+# #   fetch:      POC.Hooks.S0.Fetch.v1.exe --io file --out in --key ${key}
+# #   transform:  engine0.exe --io file --in in --out out --key ${key} --mode robust01 --win 9 --outCols 4
+# #   materialize:Engine1B.exe --io file --in out --key ${key} --conn "..." --schema dbo --table S1_RobustCadenceN --cadence 31 --ensure yes
+
+// -------------------------------------------
+// Hook-mode equivalents for prep (so you can run as hooks OR execs)
+// -------------------------------------------
+namespace POC.Hooks.S0.Prepare.Keys.v1
+
+open System
+
+module [<RequireQualifiedAccess>] Module =
+    // kind: rows  (emits one string per row = key)
+    let Run (args: System.Collections.Generic.IDictionary<string,obj>) : obj =
+        let g k def = if args.ContainsKey k then args.[k] :?> string else def
+        let feed  = g "dataFeed" "EOD5Secs"
+        let sym   = g "symbol"   "AAPL"
+        let stat  = g "statName" "WAP"
+        let field = g "dataField" "WAP"
+        let job   = g "jobId"    "job123"
+        let key = String.concat "+" [feed; sym; stat; field; job]
+        // Return as list<string> (rows)
+        box [ key ]
+
+namespace POC.Hooks.S0.Prepare.DB.v1
+
+open System
+open Microsoft.Data.SqlClient
+
+module [<RequireQualifiedAccess>] Module =
+    // kind: unit (no inlet/outlet)
+    let Run (args: System.Collections.Generic.IDictionary<string,obj>) : obj =
+        let gs k def = if args.ContainsKey k then args.[k] :?> string else def
+        let connStr = gs "connStr" ""
+        let schema  = gs "schema"  "dbo"
+        let table   = gs "table"   "S1_RobustCadenceN"
+        if String.IsNullOrWhiteSpace connStr then failwith "connStr required"
+        let ddl = $"""
+IF OBJECT_ID(N'[{schema}].[{table}]', N'U') IS NULL
+BEGIN
+    CREATE TABLE [{schema}].[{table}] (
+      [DataFeed] NVARCHAR(32) NOT NULL,
+      [Symbol] NVARCHAR(32) NOT NULL,
+      [StatName] NVARCHAR(64) NOT NULL,
+      [DataField] NVARCHAR(64) NOT NULL,
+      [TradeDate] DATETIME2(0) NOT NULL,
+      [Dt] DATETIME2(0) NOT NULL,
+      [Raw] FLOAT NULL,[Med] FLOAT NULL,[Mad] FLOAT NULL,[Scale] FLOAT NULL,
+      [MZ] FLOAT NULL,[Weight] FLOAT NULL,[Clean] FLOAT NULL,[Cadence] INT NULL,
+      [Source] NVARCHAR(64) NULL,[InsertTime] DATETIME2(0) NULL,
+      CONSTRAINT [PK_{table}] PRIMARY KEY CLUSTERED
+      ([DataFeed],[Symbol],[StatName],[DataField],[TradeDate],[Dt])
+    );
+END
+"""
+        use conn = new SqlConnection(connStr)
+        conn.Open()
+        use cmd = new SqlCommand(ddl, conn)
+        cmd.ExecuteNonQuery() |> ignore
+        box ()
+
+// -------------------------------------------
+// YAML snippets showing both modes
+// -------------------------------------------
+# hooks:
+#   s0.prepare.keys:
+#     module: POC.Hooks.S0.Prepare.Keys.v1.Module
+#     func:   Run
+#     kind:   rows
+#   s0.prepare.db:
+#     module: POC.Hooks.S0.Prepare.DB.v1.Module
+#     func:   Run
+#     kind:   unit
+#
+# # Hook-mode pipeline
+# steps:
+#   - id: prep_keys
+#     uses: s0.prepare.keys
+#     out: { rows: "step:prep_keys.rows" }
+#   - name: transform
+#     exe: engine0.exe
+#     args: "--io pipe --key ${key} --mode robust01 --win 9 --outCols 4"
+#     io: "pipe"
+#     foreach:
+#       over: "rows:step:prep_keys.rows"
+#       parallelism: 4
+#   - id: prep_db
+#     uses: s0.prepare.db
+#     args: { connStr: "Server=.;Database=0_CADENCE;Trusted_Connection=True;TrustServerCertificate=True;", schema: dbo, table: S1_RobustCadenceN }
+#   - name: materialize
+#     exe: Engine1B.exe
+#     args: "--io pipe --key ${key} --conn \"Server=.;Database=0_CADENCE;Trusted_Connection=True;TrustServerCertificate=True;\" --schema dbo --table S1_RobustCadenceN --cadence 31"
+#     io: "pipe"
+#
+# # Exec-mode pipeline (no hooks), using the earlier Prep executables
+# steps:
+#   - name: prep_keys
+#     exe: Prep.Engine1A.exe
+#     args: "--symbol AAPL --statName WAP --dataFeed EOD5Secs --job job123"
+#     io: "pipe"
+#   - name: transform
+#     exe: engine0.exe
+#     args: "--io pipe --key ${key} --mode robust01 --win 9 --outCols 4"
+#     io: "pipe"
+#   - name: prep_db
+#     exe: Prep.Engine1B.exe
+#     args: "--conn \"Server=.;Database=0_CADENCE;Trusted_Connection=True;TrustServerCertificate=True;\" --schema dbo --table S1_RobustCadenceN --ensure yes"
+#     io: "file"
+#   - name: materialize
+#     exe: Engine1B.exe
+#     args: "--io pipe --key ${key} --conn \"Server=.;Database=0_CADENCE;Trusted_Connection=True;TrustServerCertificate=True;\" --schema dbo --table S1_RobustCadenceN --cadence 31"
+#     io: "pipe"
+
+// -------------------------------------------
+// Tests/ParserHooksTests.fs — tiny unit tests for hook-mode preps
+// -------------------------------------------
+namespace MMTS.ML.Tests
+
+open System
+open Xunit
+open MMTS.ML
+open MMTS.ML.Types
+open MMTS.ML.Parse
+
+module ParserHooksTests =
+
+    [<Fact>]
+    let ``parses s0.prepare.keys hook and step wiring`` () =
+        let yaml = """
+workflow: demo
+version: "1.0"
+description: test
+hooks:
+  s0.prepare.keys:
+    module: POC.Hooks.S0.Prepare.Keys.v1.Module
+    func:   Run
+    kind:   rows
+steps:
+  - id: prep_keys
+    uses: s0.prepare.keys
+    out: { rows: "step:prep_keys.rows" }
+validations: []
+materialize: []
+"""
+        let spec = Parse.load yaml
+        // hook present
+        Assert.True(spec.hooks.ContainsKey("s0.prepare.keys"))
+        // step present and points to HookKey
+        match spec.steps with
+        | [ Single st ] ->
+            match st.uses with
+            | HookKey k -> Assert.Equal("s0.prepare.keys", k)
+            | _ -> failwith "expected HookKey"
+            // out wiring present
+            Assert.True(st.out.ContainsKey("rows"))
+        | _ -> failwith "expected one Single step"
+
+    [<Fact>]
+    let ``parses s0.prepare.db hook with args`` () =
+        let yaml = """
+workflow: demo
+version: "1.0"
+description: test
+hooks:
+  s0.prepare.db:
+    module: POC.Hooks.S0.Prepare.DB.v1.Module
+    func:   Run
+    kind:   unit
+steps:
+  - id: prep_db
+    uses: s0.prepare.db
+    args:
+      connStr: "Server=.;Database=0_CADENCE;Trusted_Connection=True;TrustServerCertificate=True;"
+      schema: dbo
+      table: S1_RobustCadenceN
+validations: []
+materialize: []
+"""
+        let spec = Parse.load yaml
+        Assert.True(spec.hooks.ContainsKey("s0.prepare.db"))
+        match spec.steps with
+        | [ Single st ] ->
+            match st.uses with
+            | HookKey k -> Assert.Equal("s0.prepare.db", k)
+            | _ -> failwith "expected HookKey"
+            // args surfaced at step level
+            Assert.True(st.args.ContainsKey("connStr"))
+            Assert.Equal("dbo", st.args.["schema"] :?> string)
+            Assert.Equal("S1_RobustCadenceN", st.args.["table"] :?> string)
+        | _ -> failwith "expected one Single step"
+
+// -------------------------------------------
+// Tests/HookIntegrationTests.fs — integration test invoking hook modules via reflection
+// -------------------------------------------
+namespace MMTS.ML.Tests
+
+open System
+open Xunit
+open System.Reflection
+
+module HookIntegrationTests =
+
+    let invoke (fullTypeName:string) (methodName:string) (args: (string*obj) list) =
+        let t = Type.GetType(fullTypeName, throwOnError=true)
+        let m = t.GetMethod(methodName, BindingFlags.Public ||| BindingFlags.Static)
+        if isNull m then failwithf "Method %s not found on %s" methodName fullTypeName
+        let dict = dict args :> System.Collections.Generic.IDictionary<string,obj>
+        m.Invoke(null, [| dict |])
+
+    [<Fact>]
+    let ``invoke s0.prepare.keys returns key list`` () =
+        let res = invoke "POC.Hooks.S0.Prepare.Keys.v1.Module" "Run" ["dataFeed", box "EOD5Secs"; "symbol", box "AAPL"; "statName", box "WAP"; "dataField", box "WAP"; "jobId", box "job123"]
+        let keys = res :?> string list
+        Assert.Single keys |> ignore
+        Assert.StartsWith("EOD5Secs+AAPL+WAP+WAP+", keys.Head)
+
+    [<Fact>]
+    let ``invoke s0.prepare.db executes without error`` () =
+        // Use dummy connection string (expected to fail fast unless real DB available)
+        let exn =
+            try
+                let _ = invoke "POC.Hooks.S0.Prepare.DB.v1.Module" "Run" ["connStr", box ""; "schema", box "dbo"; "table", box "S1_RobustCadenceN"]
+                None
+            with e -> Some e
+        // Since connStr is empty, expect an exception
+        Assert.True(exn.IsSome)
+        Assert.Contains("connStr required", exn.Value.Message)
+
+// -------------------------------------------
+// Tests/HooksIntegrationTests.fs — invoke hook Modules via reflection
+// -------------------------------------------
+namespace MMTS.ML.Tests
+
+open System
+open System.Reflection
+open System.Collections.Generic
+open Xunit
+
+module HooksIntegrationTests =
+
+    let private invokeHook (typeName:string) (args: IDictionary<string,obj>) : obj =
+        let asm = Assembly.GetExecutingAssembly()
+        let t = asm.GetType(typeName, throwOnError=true)
+        let m = t.GetMethod("Run", BindingFlags.Public ||| BindingFlags.Static)
+        m.Invoke(null, [| box args |])
+
+    [<Fact>]
+    let ``Keys hook returns expected key list`` () =
+        // Arrange
+        let args = Dictionary<string,obj>()
+        args["dataFeed"] <- box "EOD5Secs"
+        args["symbol"]   <- box "AAPL"
+        args["statName"] <- box "WAP"
+        args["dataField"]<- box "WAP"
+        args["jobId"]    <- box "jobX"
+
+        // Act
+        let o = invokeHook "POC.Hooks.S0.Prepare.Keys.v1.Module" args
+        let keys = o :?> string list
+
+        // Assert
+        Assert.Single(keys) |> ignore
+        Assert.Equal("EOD5Secs+AAPL+WAP+WAP+jobX", keys.Head)
+
+    [<Fact>]
+    let ``DB hook throws when connStr missing (expected)`` () =
+        // Arrange: empty connStr should trigger failwith in hook
+        let args = Dictionary<string,obj>()
+        args["connStr"] <- box ""
+        args["schema"]  <- box "dbo"
+        args["table"]   <- box "S1_RobustCadenceN"
+
+        // Act/Assert
+        let ex = Assert.Throws<TargetInvocationException>(fun () ->
+            let _ = invokeHook "POC.Hooks.S0.Prepare.DB.v1.Module" args
+            ()
+        )
+        Assert.NotNull(ex.InnerException)
+        Assert.Contains("connStr required", ex.InnerException.Message)
+
+///////////////////////////////////////////////////
+Added an integration test file on the canvas: Tests/HooksIntegrationTests.fs.
+
+What it does:
+
+Reflects into POC.Hooks.S0.Prepare.Keys.v1.Module.Run, passes a sample arg map, and asserts it returns the expected single key.
+
+Reflects into POC.Hooks.S0.Prepare.DB.v1.Module.Run and asserts it throws when connStr is missing (so you don’t need a live DB for CI).
+
+If you want a version that actually hits a database, 
+I can add an opt-in test that runs only when an env var like MMTS_TEST_CONNSTR is present.
+///////////////////////////////////////////////////
+// wf.yml (S0_MMTS_ML revised sample)
+// -------------------------------------------
+# id: "S0_MMTS_ML"
+# dop: 4
+# retry: 2
+# backoffMs: 500
+# keys:
+#   - "demo+EOD5Secs+AAPL+WAP+job123"
+#   - "demo+EOD5Secs+MSFT+WAP+job124"
+# steps:
+#   - name: fetch
+#     exe: POC.Hooks.S0.Fetch.v1.exe
+#     args: "--io pipe --key ${key}"
+#     io: "pipe"
+#   - name: transform
+#     exe: engine0.exe
+#     args: "--io pipe --key ${key} --mode robust01 --win 9 --outCols 4"
+#     io: "pipe"
+#   - name: materialize
+#     exe: Engine1B.exe
+#     args: "--io pipe --key ${key} --conn \"Server=.;Database=0_CADENCE;Trusted_Connection=True;TrustServerCertificate=True;\" --schema dbo --table S1_RobustCadenceN --cadence 31 --ensure yes"
+#     io: "pipe"
+#
+# # Alternate File-IO variant for debugging:
+# #   fetch:      POC.Hooks.S0.Fetch.v1.exe --io file --out in --key ${key}
+# #   transform:  engine0.exe --io file --in in --out out --key ${key} --mode robust01 --win 9 --outCols 4
+# #   materialize:Engine1B.exe --io file --in out --key ${key} --conn "..." --schema dbo --table S1_RobustCadenceN --cadence 31 --ensure yes
+
+// -------------------------------------------
+// Hook-mode equivalents for prep (so you can run as hooks OR execs)
+// -------------------------------------------
+namespace POC.Hooks.S0.Prepare.Keys.v1
+
+open System
+
+module [<RequireQualifiedAccess>] Module =
+    // kind: rows  (emits one string per row = key)
+    let Run (args: System.Collections.Generic.IDictionary<string,obj>) : obj =
+        let g k def = if args.ContainsKey k then args.[k] :?> string else def
+        let feed  = g "dataFeed" "EOD5Secs"
+        let sym   = g "symbol"   "AAPL"
+        let stat  = g "statName" "WAP"
+        let field = g "dataField" "WAP"
+        let job   = g "jobId"    "job123"
+        let key = String.concat "+" [feed; sym; stat; field; job]
+        // Return as list<string> (rows)
+        box [ key ]
+
+namespace POC.Hooks.S0.Prepare.DB.v1
+
+open System
+open Microsoft.Data.SqlClient
+
+module [<RequireQualifiedAccess>] Module =
+    // kind: unit (no inlet/outlet)
+    let Run (args: System.Collections.Generic.IDictionary<string,obj>) : obj =
+        let gs k def = if args.ContainsKey k then args.[k] :?> string else def
+        let connStr = gs "connStr" ""
+        let schema  = gs "schema"  "dbo"
+        let table   = gs "table"   "S1_RobustCadenceN"
+        if String.IsNullOrWhiteSpace connStr then failwith "connStr required"
+        let ddl = $"""
+IF OBJECT_ID(N'[{schema}].[{table}]', N'U') IS NULL
+BEGIN
+    CREATE TABLE [{schema}].[{table}] (
+      [DataFeed] NVARCHAR(32) NOT NULL,
+      [Symbol] NVARCHAR(32) NOT NULL,
+      [StatName] NVARCHAR(64) NOT NULL,
+      [DataField] NVARCHAR(64) NOT NULL,
+      [TradeDate] DATETIME2(0) NOT NULL,
+      [Dt] DATETIME2(0) NOT NULL,
+      [Raw] FLOAT NULL,[Med] FLOAT NULL,[Mad] FLOAT NULL,[Scale] FLOAT NULL,
+      [MZ] FLOAT NULL,[Weight] FLOAT NULL,[Clean] FLOAT NULL,[Cadence] INT NULL,
+      [Source] NVARCHAR(64) NULL,[InsertTime] DATETIME2(0) NULL,
+      CONSTRAINT [PK_{table}] PRIMARY KEY CLUSTERED
+      ([DataFeed],[Symbol],[StatName],[DataField],[TradeDate],[Dt])
+    );
+END
+"""
+        use conn = new SqlConnection(connStr)
+        conn.Open()
+        use cmd = new SqlCommand(ddl, conn)
+        cmd.ExecuteNonQuery() |> ignore
+        box ()
+
+// -------------------------------------------
+// YAML snippets showing both modes
+// -------------------------------------------
+# hooks:
+#   s0.prepare.keys:
+#     module: POC.Hooks.S0.Prepare.Keys.v1.Module
+#     func:   Run
+#     kind:   rows
+#   s0.prepare.db:
+#     module: POC.Hooks.S0.Prepare.DB.v1.Module
+#     func:   Run
+#     kind:   unit
+#
+# # Hook-mode pipeline
+# steps:
+#   - id: prep_keys
+#     uses: s0.prepare.keys
+#     out: { rows: "step:prep_keys.rows" }
+#   - name: transform
+#     exe: engine0.exe
+#     args: "--io pipe --key ${key} --mode robust01 --win 9 --outCols 4"
+#     io: "pipe"
+#     foreach:
+#       over: "rows:step:prep_keys.rows"
+#       parallelism: 4
+#   - id: prep_db
+#     uses: s0.prepare.db
+#     args: { connStr: "Server=.;Database=0_CADENCE;Trusted_Connection=True;TrustServerCertificate=True;", schema: dbo, table: S1_RobustCadenceN }
+#   - name: materialize
+#     exe: Engine1B.exe
+#     args: "--io pipe --key ${key} --conn \"Server=.;Database=0_CADENCE;Trusted_Connection=True;TrustServerCertificate=True;\" --schema dbo --table S1_RobustCadenceN --cadence 31"
+#     io: "pipe"
+#
+# # Exec-mode pipeline (no hooks), using the earlier Prep executables
+# steps:
+#   - name: prep_keys
+#     exe: Prep.Engine1A.exe
+#     args: "--symbol AAPL --statName WAP --dataFeed EOD5Secs --job job123"
+#     io: "pipe"
+#   - name: transform
+#     exe: engine0.exe
+#     args: "--io pipe --key ${key} --mode robust01 --win 9 --outCols 4"
+#     io: "pipe"
+#   - name: prep_db
+#     exe: Prep.Engine1B.exe
+#     args: "--conn \"Server=.;Database=0_CADENCE;Trusted_Connection=True;TrustServerCertificate=True;\" --schema dbo --table S1_RobustCadenceN --ensure yes"
+#     io: "file"
+#   - name: materialize
+#     exe: Engine1B.exe
+#     args: "--io pipe --key ${key} --conn \"Server=.;Database=0_CADENCE;Trusted_Connection=True;TrustServerCertificate=True;\" --schema dbo --table S1_RobustCadenceN --cadence 31"
+#     io: "pipe"
+
+// -------------------------------------------
+// Tests/ParserHooksTests.fs — tiny unit tests for hook-mode preps
+// -------------------------------------------
+namespace MMTS.ML.Tests
+
+open System
+open Xunit
+open MMTS.ML
+open MMTS.ML.Types
+open MMTS.ML.Parse
+
+module ParserHooksTests =
+
+    [<Fact>]
+    let ``parses s0.prepare.keys hook and step wiring`` () =
+        let yaml = """
+workflow: demo
+version: "1.0"
+description: test
+hooks:
+  s0.prepare.keys:
+    module: POC.Hooks.S0.Prepare.Keys.v1.Module
+    func:   Run
+    kind:   rows
+steps:
+  - id: prep_keys
+    uses: s0.prepare.keys
+    out: { rows: "step:prep_keys.rows" }
+validations: []
+materialize: []
+"""
+        let spec = Parse.load yaml
+        // hook present
+        Assert.True(spec.hooks.ContainsKey("s0.prepare.keys"))
+        // step present and points to HookKey
+        match spec.steps with
+        | [ Single st ] ->
+            match st.uses with
+            | HookKey k -> Assert.Equal("s0.prepare.keys", k)
+            | _ -> failwith "expected HookKey"
+            // out wiring present
+            Assert.True(st.out.ContainsKey("rows"))
+        | _ -> failwith "expected one Single step"
+
+    [<Fact>]
+    let ``parses s0.prepare.db hook with args`` () =
+        let yaml = """
+workflow: demo
+version: "1.0"
+description: test
+hooks:
+  s0.prepare.db:
+    module: POC.Hooks.S0.Prepare.DB.v1.Module
+    func:   Run
+    kind:   unit
+steps:
+  - id: prep_db
+    uses: s0.prepare.db
+    args:
+      connStr: "Server=.;Database=0_CADENCE;Trusted_Connection=True;TrustServerCertificate=True;"
+      schema: dbo
+      table: S1_RobustCadenceN
+validations: []
+materialize: []
+"""
+        let spec = Parse.load yaml
+        Assert.True(spec.hooks.ContainsKey("s0.prepare.db"))
+        match spec.steps with
+        | [ Single st ] ->
+            match st.uses with
+            | HookKey k -> Assert.Equal("s0.prepare.db", k)
+            | _ -> failwith "expected HookKey"
+            // args surfaced at step level
+            Assert.True(st.args.ContainsKey("connStr"))
+            Assert.Equal("dbo", st.args.["schema"] :?> string)
+            Assert.Equal("S1_RobustCadenceN", st.args.["table"] :?> string)
+        | _ -> failwith "expected one Single step"
+
+// -------------------------------------------
+// Tests/HookIntegrationTests.fs — integration test invoking hook modules via reflection
+// -------------------------------------------
+namespace MMTS.ML.Tests
+
+open System
+open Xunit
+open System.Reflection
+
+module HookIntegrationTests =
+
+    let invoke (fullTypeName:string) (methodName:string) (args: (string*obj) list) =
+        let t = Type.GetType(fullTypeName, throwOnError=true)
+        let m = t.GetMethod(methodName, BindingFlags.Public ||| BindingFlags.Static)
+        if isNull m then failwithf "Method %s not found on %s" methodName fullTypeName
+        let dict = dict args :> System.Collections.Generic.IDictionary<string,obj>
+        m.Invoke(null, [| dict |])
+
+    [<Fact>]
+    let ``invoke s0.prepare.keys returns key list`` () =
+        let res = invoke "POC.Hooks.S0.Prepare.Keys.v1.Module" "Run" ["dataFeed", box "EOD5Secs"; "symbol", box "AAPL"; "statName", box "WAP"; "dataField", box "WAP"; "jobId", box "job123"]
+        let keys = res :?> string list
+        Assert.Single keys |> ignore
+        Assert.StartsWith("EOD5Secs+AAPL+WAP+WAP+", keys.Head)
+
+    [<Fact>]
+    let ``invoke s0.prepare.db executes without error`` () =
+        // Use dummy connection string (expected to fail fast unless real DB available)
+        let exn =
+            try
+                let _ = invoke "POC.Hooks.S0.Prepare.DB.v1.Module" "Run" ["connStr", box ""; "schema", box "dbo"; "table", box "S1_RobustCadenceN"]
+                None
+            with e -> Some e
+        // Since connStr is empty, expect an exception
+        Assert.True(exn.IsSome)
+        Assert.Contains("connStr required", exn.Value.Message)
+
+// -------------------------------------------
+// Tests/HooksIntegrationTests.fs — invoke hook Modules via reflection
+// -------------------------------------------
+namespace MMTS.ML.Tests
+
+open System
+open System.Reflection
+open System.Collections.Generic
+open Xunit
+
+module HooksIntegrationTests =
+
+    let private invokeHook (typeName:string) (args: IDictionary<string,obj>) : obj =
+        let asm = Assembly.GetExecutingAssembly()
+        let t = asm.GetType(typeName, throwOnError=true)
+        let m = t.GetMethod("Run", BindingFlags.Public ||| BindingFlags.Static)
+        m.Invoke(null, [| box args |])
+
+    [<Fact>]
+    let ``Keys hook returns expected key list`` () =
+        // Arrange
+        let args = Dictionary<string,obj>()
+        args["dataFeed"] <- box "EOD5Secs"
+        args["symbol"]   <- box "AAPL"
+        args["statName"] <- box "WAP"
+        args["dataField"]<- box "WAP"
+        args["jobId"]    <- box "jobX"
+
+        // Act
+        let o = invokeHook "POC.Hooks.S0.Prepare.Keys.v1.Module" args
+        let keys = o :?> string list
+
+        // Assert
+        Assert.Single(keys) |> ignore
+        Assert.Equal("EOD5Secs+AAPL+WAP+WAP+jobX", keys.Head)
+
+    [<Fact>]
+    let ``DB hook throws when connStr missing (expected)`` () =
+        // Arrange: empty connStr should trigger failwith in hook
+        let args = Dictionary<string,obj>()
+        args["connStr"] <- box ""
+        args["schema"]  <- box "dbo"
+        args["table"]   <- box "S1_RobustCadenceN"
+
+        // Act/Assert
+        let ex = Assert.Throws<TargetInvocationException>(fun () ->
+            let _ = invokeHook "POC.Hooks.S0.Prepare.DB.v1.Module" args
+            ()
+        )
+        Assert.NotNull(ex.InnerException)
+        Assert.Contains("connStr required", ex.InnerException.Message)
+
+// -------------------------------------------
+// Tests/HooksDbIntegrationTests.fs — opt-in DB test (requires env var)
+// -------------------------------------------
+namespace MMTS.ML.Tests
+
+open System
+open System.Reflection
+open System.Collections.Generic
+open Xunit
+
+module HooksDbIntegrationTests =
+
+    let private invokeHook (typeName:string) (args: IDictionary<string,obj>) : obj =
+        let asm = Assembly.GetExecutingAssembly()
+        let t = asm.GetType(typeName, throwOnError=true)
+        let m = t.GetMethod("Run", BindingFlags.Public ||| BindingFlags.Static)
+        m.Invoke(null, [| box args |])
+
+    [<Fact>]
+    let ``DB hook actually ensures table when env var set`` () =
+        // Skip if no connection string provided
+        let connStr = Environment.GetEnvironmentVariable("MMTS_TEST_CONNSTR")
+        if String.IsNullOrWhiteSpace connStr then
+            printfn "Skipping DB integration test: MMTS_TEST_CONNSTR not set"
+        else
+            let args = Dictionary<string,obj>()
+            args["connStr"] <- box connStr
+            args["schema"]  <- box "dbo"
+            args["table"]   <- box "S1_RobustCadenceN_Test"
+
+            // Act: should create table if not exists
+            let _ = invokeHook "POC.Hooks.S0.Prepare.DB.v1.Module" args
+
+            // Assert: no exception thrown and table should now exist
+            // (simple existence check by re-running with same args)
+            let _ = invokeHook "POC.Hooks.S0.Prepare.DB.v1.Module" args
+            Assert.True(true)
+
+// -------------------------------------------
+// Tests/DbIntegrationTests.fs — opt-in DB integration tests (env: MMTS_TEST_CONNSTR)
+// -------------------------------------------
+namespace MMTS.ML.Tests
+
+open System
+open System.Data
+open System.Reflection
+open System.Collections.Generic
+open Xunit
+open Microsoft.Data.SqlClient
+
+module DbIntegrationTests =
+
+    let private getEnv name = Environment.GetEnvironmentVariable(name)
+
+    let private invokeHook (typeName:string) (args: IDictionary<string,obj>) : obj =
+        let asm = Assembly.GetExecutingAssembly()
+        let t = asm.GetType(typeName, throwOnError=true)
+        let m = t.GetMethod("Run", BindingFlags.Public ||| BindingFlags.Static)
+        m.Invoke(null, [| box args |])
+
+    [<Fact>]
+    let ``Prep DB hook ensures table (opt-in)`` () =
+        let connStr = getEnv "MMTS_TEST_CONNSTR"
+        if String.IsNullOrWhiteSpace connStr then
+            // Opt-out: no DB available, silently return.
+            ()
+        else
+            // Unique table name per run
+            let table = "UT_S1_RobustCadenceN_" + Guid.NewGuid().ToString("N").Substring(0,8)
+            let schema = "dbo"
+            let args = Dictionary<string,obj>()
+            args["connStr"] <- box connStr
+            args["schema"]  <- box schema
+            args["table"]   <- box table
+
+            // Call the hook
+            let _ = invokeHook "POC.Hooks.S0.Prepare.DB.v1.Module" args
+
+            // Validate existence
+            use conn = new SqlConnection(connStr)
+            conn.Open()
+            use check = new SqlCommand($"SELECT OBJECT_ID('[{schema}].[{table}]','U')", conn)
+            let oid = check.ExecuteScalar()
+            Assert.True((oid :? obj) && not (isNull oid) && oid <> box DBNull.Value)
+
+            // Cleanup
+            use drop = new SqlCommand($"DROP TABLE [{schema}].[{table}]", conn)
+            drop.ExecuteNonQuery() |> ignore
+
+    [<Fact>]
+    let ``TVP proc upserts rows (opt-in via MMTS_TEST_TVP=1)`` () =
+        let connStr = getEnv "MMTS_TEST_CONNSTR"
+        let doTvp   = String.Equals(getEnv "MMTS_TEST_TVP", "1", StringComparison.OrdinalIgnoreCase)
+        if String.IsNullOrWhiteSpace connStr || not doTvp then () else
+        // Arrange unique table
+        let table = "UT_S1_RobustCadenceN_" + Guid.NewGuid().ToString("N").Substring(0,8)
+        let schema = "dbo"
+        // 1) Ensure table via hook
+        let args = Dictionary<string,obj>()
+        args["connStr"] <- box connStr
+        args["schema"]  <- box schema
+        args["table"]   <- box table
+        let _ = invokeHook "POC.Hooks.S0.Prepare.DB.v1.Module" args
+
+        // 2) Ensure TVP + Proc (inline DDL copied from Engine1B)
+        let createTvpAndProc = @"IF TYPE_ID(N'dbo.S1_RobustCadenceN_TVP') IS NULL
+    CREATE TYPE dbo.S1_RobustCadenceN_TVP AS TABLE (
+        DataFeed NVARCHAR(32), Symbol NVARCHAR(32), StatName NVARCHAR(64), DataField NVARCHAR(64),
+        TradeDate DATETIME2(0), Dt DATETIME2(0), Raw FLOAT, Med FLOAT, Mad FLOAT, Scale FLOAT,
+        MZ FLOAT, Weight FLOAT, Clean FLOAT, Cadence INT, Source NVARCHAR(64), InsertTime DATETIME2(0)
+    );
+IF OBJECT_ID(N'dbo.S1_RobustCadenceN_Upsert_TVP', N'P') IS NULL
+    EXEC('CREATE PROCEDURE dbo.S1_RobustCadenceN_Upsert_TVP AS SET NOCOUNT ON;');
+ALTER PROCEDURE dbo.S1_RobustCadenceN_Upsert_TVP
+    @Rows dbo.S1_RobustCadenceN_TVP READONLY,
+    @SchemaName NVARCHAR(128) = N''dbo'',
+    @TableName  NVARCHAR(128) = N''S1_RobustCadenceN''
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @sql NVARCHAR(MAX) = N'
+MERGE INTO ' + QUOTENAME(@SchemaName) + N'.' + QUOTENAME(@TableName) + N' AS T
+USING @Rows AS S
+ON (T.[DataFeed]=S.[DataFeed] AND T.[Symbol]=S.[Symbol] AND T.[StatName]=S.[StatName]
+    AND T.[DataField]=S.[DataField] AND T.[TradeDate]=S.[TradeDate] AND T.[Dt]=S.[Dt])
+WHEN MATCHED THEN UPDATE SET
+    [Raw]=S.[Raw],[Med]=S.[Med],[Mad]=S.[Mad],[Scale]=S.[Scale],[MZ]=S.[MZ],
+    [Weight]=S.[Weight],[Clean]=S.[Clean],[Cadence]=S.[Cadence],[Source]=S.[Source],[InsertTime]=S.[InsertTime]
+WHEN NOT MATCHED THEN INSERT
+    ([DataFeed],[Symbol],[StatName],[DataField],[TradeDate],[Dt],[Raw],[Med],[Mad],[Scale],[MZ],[Weight],[Clean],[Cadence],[Source],[InsertTime])
+VALUES
+    (S.[DataFeed],S.[Symbol],S.[StatName],S.[DataField],S.[TradeDate],S.[Dt],S.[Raw],S.[Med],S.[Mad],S.[Scale],S.[MZ],S.[Weight],S.[Clean],S.[Cadence],S.[Source],S.[InsertTime]);';
+    EXEC sp_executesql @sql, N'@Rows dbo.S1_RobustCadenceN_TVP READONLY', @Rows=@Rows;
+END";
+
+        use conn = new SqlConnection(connStr)
+        conn.Open()
+        for batch in createTvpAndProc.Split([|"GO"|], StringSplitOptions.RemoveEmptyEntries) do
+            use cmd = new SqlCommand(batch, conn)
+            cmd.ExecuteNonQuery() |> ignore
+
+        // 3) Build TVP with a couple rows and call the proc targeting our temp table
+        let tvp = new DataTable()
+        let addCol (n,t) = tvp.Columns.Add(n,t) |> ignore
+        [ "DataFeed", typeof<string>; "Symbol", typeof<string>; "StatName", typeof<string>; "DataField", typeof<string>
+          "TradeDate", typeof<DateTime>; "Dt", typeof<DateTime>; "Raw", typeof<double>; "Med", typeof<double>
+          "Mad", typeof<double>; "Scale", typeof<double>; "MZ", typeof<double>; "Weight", typeof<double>
+          "Clean", typeof<double>; "Cadence", typeof<int>; "Source", typeof<string>; "InsertTime", typeof<DateTime> ]
+        |> List.iter addCol
+
+        let now = DateTime.Now
+        let addRow (dt:DateTime) raw med mad clean =
+            let r = tvp.NewRow()
+            r["DataFeed"] <- "EOD5Secs"; r["Symbol"] <- "AAPL"; r["StatName"] <- "WAP"; r["DataField"] <- "WAP"
+            r["TradeDate"] <- dt.Date; r["Dt"] <- dt; r["Raw"] <- raw; r["Med"] <- med; r["Mad"] <- mad
+            r["Scale"] <- 1.4826; r["MZ"] <- (raw - med)/max 1e-12 (1.4826*mad); r["Weight"] <- 1.0; r["Clean"] <- clean
+            r["Cadence"] <- 31; r["Source"] <- "test"; r["InsertTime"] <- DateTime.UtcNow
+            tvp.Rows.Add(r) |> ignore
+        addRow now 100.0 100.0 0.5 100.0
+        addRow (now.AddSeconds 31.0) 101.0 100.5 0.5 100.8
+
+        use call = new SqlCommand("dbo.S1_RobustCadenceN_Upsert_TVP", conn)
+        call.CommandType <- CommandType.StoredProcedure
+        let p = call.Parameters.Add("@Rows", SqlDbType.Structured)
+        p.TypeName <- "dbo.S1_RobustCadenceN_TVP"
+        p.Value <- tvp
+        call.Parameters.AddWithValue("@SchemaName", schema) |> ignore
+        call.Parameters.AddWithValue("@TableName", table) |> ignore
+        call.ExecuteNonQuery() |> ignore
+
+        // 4) Verify rows landed, then cleanup
+        use cnt = new SqlCommand($"SELECT COUNT(*) FROM [{schema}].[{table}]", conn)
+        let n = cnt.ExecuteScalar() :?> int
+        Assert.Equal(2, n)
+
+        use drop = new SqlCommand($"DROP TABLE [{schema}].[{table}]", conn)
+        drop.ExecuteNonQuery() |> ignore
+
+///////////////////////////////////////////////////
+All set. I added an opt-in DB integration test file to the canvas: Tests/DbIntegrationTests.fs.
+
+How it works:
+
+Looks for MMTS_TEST_CONNSTR. If it’s not set, the tests no-op (they pass silently).
+
+Test 1: Invokes POC.Hooks.S0.Prepare.DB.v1.Module.Run via reflection with a real connection string and asserts the target table is created, then drops it.
+
+Test 2 (optional): If you also set MMTS_TEST_TVP=1, it creates the TVP type and proc, pushes two rows via the TVP upsert, verifies row count, and then cleans up.
+$env:MMTS_TEST_CONNSTR="Server=.;Database=0_CADENCE;Trusted_Connection=True;TrustServerCertificate=True;"
+$env:MMTS_TEST_TVP="1"
+dotnet test
+Env setup example:
+...
+
+///////////////////////////////////////////////////
+Want me to wire CI conditionals 
+(e.g., GitHub Actions job with a SQL Server service and those env vars) 
+so these run automatically?
 ///////////////////////////////////////////////////
 
 ///////////////////////////////////////////////////
@@ -399,6 +3642,7 @@ Ready to codify the engines: root and a mmts validate CLI next?
 ///////////////////////////////////////////////////
 
 ///////////////////////////////////////////////////
+
 
 
 

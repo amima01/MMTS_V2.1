@@ -6,6 +6,7 @@
     <File Path="CHATS/chats_2025-09-14.txt" />
   </Folder>
   <Folder Name="/Doc/yaml/">
+    <File Path="S0_MMTS_ML_2025-09-14.txt" />
     <File Path="YAML/S0_MMTS_ML_2025-09-13.txt" />
   </Folder>
   <Project Path="MMTS.S0.Worker/MMTS.S0.Worker.fsproj" Id="5e4e00c3-235e-4d6c-9d15-4cb315a80557" />

@@ -1,0 +1,27 @@
+// wf.yml (S0_MMTS_ML revised sample)
+// -------------------------------------------
+# id: "S0_MMTS_ML"
+# dop: 4
+# retry: 2
+# backoffMs: 500
+# keys:
+#   - "demo+EOD5Secs+AAPL+WAP+job123"
+#   - "demo+EOD5Secs+MSFT+WAP+job124"
+# steps:
+#   - name: fetch
+#     exe: POC.Hooks.S0.Fetch.v1.exe
+#     args: "--io pipe --key ${key}"
+#     io: "pipe"
+#   - name: transform
+#     exe: engine0.exe
+#     args: "--io pipe --key ${key} --mode robust01 --win 9 --outCols 4"
+#     io: "pipe"
+#   - name: materialize
+#     exe: Engine1B.exe
+#     args: "--io pipe --key ${key} --conn \"Server=.;Database=0_CADENCE;Trusted_Connection=True;TrustServerCertificate=True;\" --schema dbo --table S1_RobustCadenceN --cadence 31 --ensure yes"
+#     io: "pipe"
+#
+# # Alternate File-IO variant for debugging:
+# #   fetch:      POC.Hooks.S0.Fetch.v1.exe --io file --out in --key ${key}
+# #   transform:  engine0.exe --io file --in in --out out --key ${key} --mode robust01 --win 9 --outCols 4
+# #   materialize:Engine1B.exe --io file --in out --key ${key} --conn "..." --schema dbo --table S1_RobustCadenceN --cadence 31 --ensure yes
