@@ -1,0 +1,74 @@
+﻿# Engine1A / S1A skeleton — emits simple signal rows, then materializes
+name: "S1A_MMTS_ML"
+version: "1.0"
+
+params:
+  env: "${ENV:ASPNETCORE_ENVIRONMENT|dev}"
+  batchId: "${NOW:yyyy-MM-dd}"
+  dataFeed: "EOD5Secs"
+  impl: "v1"
+  connStr: "${ENV:MMTS_TEST_CONNSTR|Server=.;Database=S1_Signals;Trusted_Connection=True;Encrypt=False}"
+  signalName: "UPSWING_ALPHA"
+
+# Optional defaults for materialization target
+prepare:
+  s1a:
+    db:
+      schema: "dbo"
+      target: "S1A_EmittedSignals"
+    keys:
+      - "DataFeed"
+      - "Symbol"
+      - "StatName"
+      - "TradeDate"
+      - "SignalName"
+
+hooks:
+  s1a.emit:
+    module: "POC.Hooks.S1A.Emit.v1.Module"
+    func: "Run"
+    kind: "rows"
+
+steps:
+  - id: "s1a.emit"
+    in:
+      io: "none"
+    out:
+      io: "rows"
+    args:
+      env: "${param:env}"
+      impl: "${param:impl}"
+      batchId: "${param:batchId}"
+      dataFeed: "${param:dataFeed}"
+      signalName: "${param:signalName}"
+
+  - id: "s1a.materialize"
+    kind: "materialize"
+    in:
+      from: "s1a.emit"
+      io: "rows"
+    args:
+      connStr: "${param:connStr}"
+      db:
+        schema: "${prepare:s1a.db.schema}"
+        target: "${prepare:s1a.db.target}"
+      keys: "${prepare:s1a.keys}"
+      mode: "bulk_upsert"
+      pre_sql: |
+        -- (optional) preflight SQL for S1A
+      post_sql: |
+        -- (optional) postflight SQL for S1A
+      validate:
+        nonempty: true
+        schema:
+          columns:
+            - name: "DataFeed";   type: "nvarchar"
+            - name: "Symbol";     type: "nvarchar"
+            - name: "StatName";   type: "nvarchar"
+            - name: "TradeDate";  type: "datetime"
+            - name: "SignalName"; type: "nvarchar"
+            - name: "Score";      type: "float"
+            - name: "Meta";       type: "nvarchar"
+        unique:
+          - ["DataFeed","Symbol","StatName","TradeDate","SignalName"]
+

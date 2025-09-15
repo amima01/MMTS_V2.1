@@ -6,14 +6,12 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <Content Include="Workflows\S1A_MMTS_ML.txt" />
+    <Compile Include="S1A.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 
-  <ItemGroup />
-
   <ItemGroup>
-    <ProjectReference Include="..\MMTS\MMTS.fsproj" />
+    <PackageReference Include="Microsoft.Data.SqlClient" Version="6.1.1" />
   </ItemGroup>
 
 </Project>
