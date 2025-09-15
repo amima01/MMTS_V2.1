@@ -2573,8 +2573,439 @@ dotnet run --project src/Engine1A -- --run src/Engine1A/workflows/S1A_MMTS_ML.ya
 
 ////////////////////////////////////////////////////////////
 This mirrors your S0 style: one emit step producing rows, 
-then a materialize step doing the bulk-upsert via the upgraded Exec.run. If you want a multi-step S1A later (e.g., s1a.prepare → s1a.emit → s1a.enrich → s1a.materialize), 
+then a materialize step doing the bulk-upsert via the upgraded Exec.run. 
+If you want a multi-step S1A later (e.g., s1a.prepare → s1a.emit → s1a.enrich → s1a.materialize), 
 we can add more hook stubs and fan-out the YAML.
+////////////////////////////////////////////////////////////
+Let's do Engine1B, please give code to Program.fs
+...
+got it! here’s a clean, drop-in src/Engine1B/Program.fs that mirrors Engine1A’s CLI and behavior:
+
+--run <yaml> to execute a workflow
+
+--dryrun to emit the plan
+
+--step <stepId> to run up to a specific step (uses Exec.runStep)
+
+repeatable --set key=value overrides
+
+REPL passthrough if you launch without --run
+////////////////////////////////////////////////////////////
+namespace Engine1B
+
+open System
+open System.IO
+open System.Collections.Generic
+
+module Cli =
+    type Mode =
+        | Repl
+        | Run of yamlPath:string * dryRun:bool * stepId:string option * overrides:Map<string,string>
+
+    let private trySplitKV (s:string) =
+        let i = s.IndexOf('=')
+        if i > 0 && i < s.Length-1 then
+            let k = s.Substring(0, i).Trim()
+            let v = s.Substring(i+1).Trim()
+            if k <> "" then Some (k, v) else None
+        else None
+
+    /// Usage:
+    ///   engine1b --run workflows\S1B_MMTS_ML.yaml [--dryrun] [--step <stepId>] [--set key=val ...]
+    let parseArgs (argv:string[]) : Mode =
+        if argv |> Array.exists (fun a -> a = "--run") then
+            let mutable yaml = ""
+            let mutable dryRun = false
+            let mutable stepId : string option = None
+            let kvs = Dictionary<string,string>(StringComparer.OrdinalIgnoreCase)
+
+            let rec loop i =
+                if i >= argv.Length then () else
+                match argv.[i] with
+                | "--run" when i+1 < argv.Length ->
+                    yaml <- argv.[i+1]; loop (i+2)
+                | "--dryrun" ->
+                    dryRun <- true; loop (i+1)
+                | "--step" when i+1 < argv.Length ->
+                    stepId <- Some argv.[i+1]; loop (i+2)
+                | "--set" when i+1 < argv.Length ->
+                    match trySplitKV argv.[i+1] with
+                    | Some (k,v) -> kvs.[k] <- v
+                    | None -> ()
+                    loop (i+2)
+                | _ ->
+                    loop (i+1)
+            loop 0
+
+            if String.IsNullOrWhiteSpace yaml then Repl
+            else
+                let overrides =
+                    kvs |> Seq.map (fun (KeyValue(k,v)) -> k, v) |> Map.ofSeq
+                Run(yaml, dryRun, stepId, overrides)
+        else
+            Repl
+
+module Program =
+    open Cli
+
+    [<EntryPoint>]
+    let main argv =
+        try
+            match parseArgs argv with
+            | Repl ->
+                printfn "Engine1B → REPL passthrough (MMTS.ML)."
+                printfn "Commands: :load <file>, :list, :params, :set k=v, :hook show/set, :run [all|<step>], :validate [--stop-on-first-error], :emit, :dryrun emit, :save <file>, :q"
+                MMTS.ML.Repl.start()
+
+            | Run(yamlPath, dryRun, stepIdOpt, overrides) ->
+                if not (File.Exists yamlPath) then
+                    eprintfn "YAML not found: %s" yamlPath
+                    2
+                else
+                    let yamlText = File.ReadAllText yamlPath
+                    match MMTS.ML.Parse.tryParse yamlText with
+                    | Error err ->
+                        eprintfn "Parse error: %s" err
+                        3
+                    | Ok spec ->
+                        let wf' = MMTS.ML.Exec.applyParamOverrides spec overrides
+
+                        let errs = MMTS.ML.Exec.validate wf'
+                        if not errs.IsEmpty then
+                            eprintfn "Validation failed (%d):" errs.Length
+                            errs |> List.iter (fun e -> eprintfn " - %s" e)
+                            4
+                        else
+                            match dryRun, stepIdOpt with
+                            | true, _ ->
+                                printfn "DRYRUN: emitting plan for %s" (Path.GetFileName yamlPath)
+                                MMTS.ML.Exec.emitDryRun wf' |> printfn "%s"
+                                0
+                            | false, Some stepId ->
+                                printfn "RUN (step): %s → %s" (Path.GetFileName yamlPath) stepId
+                                match MMTS.ML.Exec.runStep wf' stepId with
+                                | Ok summary ->
+                                    printfn "OK: %s" summary
+                                    0
+                                | Error err ->
+                                    eprintfn "EXEC ERROR: %s" err
+                                    5
+                            | false, None ->
+                                printfn "RUN: executing %s" (Path.GetFileName yamlPath)
+                                match MMTS.ML.Exec.run wf' with
+                                | Ok summary ->
+                                    printfn "OK: %s" summary
+                                    0
+                                | Error err ->
+                                    eprintfn "EXEC ERROR: %s" err
+                                    5
+        with ex ->
+            eprintfn "FATAL: %s" (ex.ToString())
+            1
+
+////////////////////////////////////////////////////////////
+If you want a starter workflows/S1B_MMTS_ML.yaml and a stub hook 
+(e.g., a different signal family or an “alt-path” transform) I can drop those next.
+
+////////////////////////////////////////////////////////////
+src/Engine1B/workflows/S1B_MMTS_ML.yaml
+...
+# Engine1B / S1B skeleton — emits alt-path signals and materializes
+name: "S1B_MMTS_ML"
+version: "1.0"
+
+params:
+  env: "${ENV:ASPNETCORE_ENVIRONMENT|dev}"
+  batchId: "${NOW:yyyy-MM-dd}"
+  dataFeed: "EOD5Secs"
+  impl: "v1"
+  connStr: "${ENV:MMTS_TEST_CONNSTR|Server=.;Database=S1_Signals;Trusted_Connection=True;Encrypt=False}"
+  signalName: "DOWNTREND_BETA"
+
+prepare:
+  s1b:
+    db:
+      schema: "dbo"
+      target: "S1B_AltSignals"
+    keys:
+      - "DataFeed"
+      - "Symbol"
+      - "StatName"
+      - "TradeDate"
+      - "SignalName"
+
+hooks:
+  s1b.emit:
+    module: "POC.Hooks.S1B.Emit.v1.Module"
+    func: "Run"
+    kind: "rows"
+
+steps:
+  - id: "s1b.emit"
+    in:
+      io: "none"
+    out:
+      io: "rows"
+    args:
+      env: "${param:env}"
+      impl: "${param:impl}"
+      batchId: "${param:batchId}"
+      dataFeed: "${param:dataFeed}"
+      signalName: "${param:signalName}"
+
+  - id: "s1b.materialize"
+    kind: "materialize"
+    in:
+      from: "s1b.emit"
+      io: "rows"
+    args:
+      connStr: "${param:connStr}"
+      db:
+        schema: "${prepare:s1b.db.schema}"
+        target: "${prepare:s1b.db.target}"
+      keys: "${prepare:s1b.keys}"
+      mode: "bulk_upsert"
+      pre_sql: |
+        -- optional pre-sql for S1B
+      post_sql: |
+        -- optional post-sql for S1B
+      validate:
+        nonempty: true
+        schema:
+          columns:
+            - name: "DataFeed";   type: "nvarchar"
+            - name: "Symbol";     type: "nvarchar"
+            - name: "StatName";   type: "nvarchar"
+            - name: "TradeDate";  type: "datetime"
+            - name: "SignalName"; type: "nvarchar"
+            - name: "Score";      type: "float"
+            - name: "Meta";       type: "nvarchar"
+        unique:
+          - ["DataFeed","Symbol","StatName","TradeDate","SignalName"]
+
+////////////////////////////////////////////////////////////
+src/MMTS.Hooks/src/POC/Hooks.S1B.Emit.v1/Module.fs
+...
+
+namespace POC.Hooks.S1B.Emit.v1
+
+open System
+open System.Collections.Generic
+
+module Module =
+
+    type Row = IDictionary<string,obj>
+
+    let private row (pairs: (string * obj) list) : Row =
+        let d = Dictionary<string,obj>(StringComparer.OrdinalIgnoreCase) :> IDictionary<string,obj>
+        for (k,v) in pairs do d.[k] <- v
+        d
+
+    let private tryGet (k: string) (m: IDictionary<string,string>) =
+        match m.TryGetValue k with
+        | true, v -> Some v
+        | _ -> None
+
+    /// Minimal alt-path emitter: produces signals with inverted scoring
+    [<CompiledName("Run")>]
+    let Run (args: IDictionary<string,string>) : obj =
+        let env        = tryGet "env" args       |> Option.defaultValue "dev"
+        let impl       = tryGet "impl" args      |> Option.defaultValue "v1"
+        let dataFeed   = tryGet "dataFeed" args  |> Option.defaultValue "EOD5Secs"
+        let signalName = tryGet "signalName" args|> Option.defaultValue "DOWNTREND_BETA"
+        let batchId    = tryGet "batchId" args   |> Option.defaultValue DateTime.Now.ToString("yyyy-MM-dd")
+
+        // Fixed trade date for repeatability
+        let tradeDate =
+            match DateTime.TryParse batchId with
+            | true, dt -> DateTime(dt.Year, dt.Month, dt.Day, 15, 0, 0, DateTimeKind.Unspecified)
+            | _        -> DateTime(2025, 01, 17, 15, 0, 0, DateTimeKind.Unspecified)
+
+        let statName = tryGet "statName" args |> Option.defaultValue "WAP"
+
+        // Hard-coded small universe
+        let symbols = [ "AAPL"; "TSLA"; "NVDA" ]
+
+        let rows = ResizeArray<Row>()
+
+        for sym in symbols do
+            // "alt" scoring: negative of hash mod 10
+            let bump = -1.0 * (float (abs (sym.GetHashCode()) % 10) / 100.0)
+            let score = bump
+            let meta  = $"env={env};impl={impl};batchId={batchId};alt=1"
+            rows.Add(
+                row [
+                    "DataFeed",   box dataFeed
+                    "Symbol",     box sym
+                    "StatName",   box statName
+                    "TradeDate",  box tradeDate
+                    "SignalName", box signalName
+                    "Score",      box score
+                    "Meta",       box meta
+                ]
+            )
+
+        box rows
+
+
+
+////////////////////////////////////////////////////////////
+# Dryrun (plan only)
+dotnet run --project src/Engine1B -- --run src/Engine1B/workflows/S1B_MMTS_ML.yaml --dryrun
+
+# Execute
+dotnet run --project src/Engine1B -- --run src/Engine1B/workflows/S1B_MMTS_ML.yaml
+
+////////////////////////////////////////////////////////////
+This mirrors Engine1A but outputs a different signal family 
+(DOWNTREND_BETA) with a trivially inverted scoring scheme, 
+so you can test separation between 1A and 1B pipelines.
+
+Want me to also stub a materializer schema DDL 
+(SQL CREATE TABLE S1B_AltSignals) so you can pre-create the DB target before testing?
+////////////////////////////////////////////////////////////
+perfect, here’s a stub DDL you can run in your SQL Server to 
+pre-create the Engine1B materializer target table (S1B_AltSignals).
+It matches the schema you modeled in your YAML 
+(DataFeed, Symbol, StatName, TradeDate, SignalName, Score, Meta) 
+with a composite PK on the “keys”.
+////////////////////////////////////////////////////////////
+
+SQL DDL: Engine1A + Engine1B Targets
+
+////////////////////////////////////////////////////////////
+USE [S1_Signals];
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = N'dbo')
+    EXEC('CREATE SCHEMA [dbo]');
+GO
+
+IF OBJECT_ID(N'dbo.S1B_AltSignals', N'U') IS NULL
+BEGIN
+    CREATE TABLE [dbo].[S1B_AltSignals](
+        [DataFeed]   NVARCHAR(64)  NOT NULL,
+        [Symbol]     NVARCHAR(32)  NOT NULL,
+        [StatName]   NVARCHAR(64)  NOT NULL,
+        [TradeDate]  DATETIME2(0)  NOT NULL,
+        [SignalName] NVARCHAR(64)  NOT NULL,
+        [Score]      FLOAT         NULL,
+        [Meta]       NVARCHAR(MAX) NULL,
+        [InsertTime] DATETIME2(0)  NOT NULL DEFAULT (SYSUTCDATETIME())
+    );
+
+    ALTER TABLE [dbo].[S1B_AltSignals]
+        ADD CONSTRAINT [PK_S1B_AltSignals]
+            PRIMARY KEY CLUSTERED
+            (
+                [DataFeed],
+                [Symbol],
+                [StatName],
+                [TradeDate],
+                [SignalName]
+            );
+END
+GO
+
+////////////////////////////////////////////////////////////
+Notes
+
+InsertTime is optional, but handy for debugging upserts (added with a default UTC timestamp).
+
+Composite primary key (DataFeed, Symbol, StatName, TradeDate, SignalName) matches the keys: 
+section of your YAML.
+
+Meta is NVARCHAR(MAX) so you can stash any free-form text or JSON.
+
+Engine1B’s Exec.bulkUpsert will MERGE against these PK columns.
+////////////////////////////////////////////////////////////
+USE [S1_Signals];
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = N'dbo')
+    EXEC('CREATE SCHEMA [dbo]');
+GO
+
+------------------------------------------------------------
+-- Engine1A target: S1A_EmittedSignals
+------------------------------------------------------------
+IF OBJECT_ID(N'dbo.S1A_EmittedSignals', N'U') IS NULL
+BEGIN
+    CREATE TABLE [dbo].[S1A_EmittedSignals](
+        [DataFeed]   NVARCHAR(64)  NOT NULL,
+        [Symbol]     NVARCHAR(32)  NOT NULL,
+        [StatName]   NVARCHAR(64)  NOT NULL,
+        [TradeDate]  DATETIME2(0)  NOT NULL,
+        [SignalName] NVARCHAR(64)  NOT NULL,
+        [Score]      FLOAT         NULL,
+        [Meta]       NVARCHAR(MAX) NULL,
+        [InsertTime] DATETIME2(0)  NOT NULL DEFAULT (SYSUTCDATETIME())
+    );
+
+    ALTER TABLE [dbo].[S1A_EmittedSignals]
+        ADD CONSTRAINT [PK_S1A_EmittedSignals]
+            PRIMARY KEY CLUSTERED
+            (
+                [DataFeed],
+                [Symbol],
+                [StatName],
+                [TradeDate],
+                [SignalName]
+            );
+END
+GO
+
+------------------------------------------------------------
+-- Engine1B target: S1B_AltSignals
+------------------------------------------------------------
+IF OBJECT_ID(N'dbo.S1B_AltSignals', N'U') IS NULL
+BEGIN
+    CREATE TABLE [dbo].[S1B_AltSignals](
+        [DataFeed]   NVARCHAR(64)  NOT NULL,
+        [Symbol]     NVARCHAR(32)  NOT NULL,
+        [StatName]   NVARCHAR(64)  NOT NULL,
+        [TradeDate]  DATETIME2(0)  NOT NULL,
+        [SignalName] NVARCHAR(64)  NOT NULL,
+        [Score]      FLOAT         NULL,
+        [Meta]       NVARCHAR(MAX) NULL,
+        [InsertTime] DATETIME2(0)  NOT NULL DEFAULT (SYSUTCDATETIME())
+    );
+
+    ALTER TABLE [dbo].[S1B_AltSignals]
+        ADD CONSTRAINT [PK_S1B_AltSignals]
+            PRIMARY KEY CLUSTERED
+            (
+                [DataFeed],
+                [Symbol],
+                [StatName],
+                [TradeDate],
+                [SignalName]
+            );
+END
+GO
+
+////////////////////////////////////////////////////////////
+Why it matches your YAML
+
+Both tables use the same composite PK (DataFeed, Symbol, StatName, TradeDate, SignalName) 
+since those are listed in each workflow’s keys:.
+
+Column list mirrors your validate.schema.columns in both YAMLs.
+
+InsertTime with default SYSUTCDATETIME() is optional but helps track 
+inserts/updates from Exec.bulkUpsert.
+////////////////////////////////////////////////////////////
+
+////////////////////////////////////////////////////////////
+
+////////////////////////////////////////////////////////////
+
+////////////////////////////////////////////////////////////
+
+////////////////////////////////////////////////////////////
+
+////////////////////////////////////////////////////////////
+
 ////////////////////////////////////////////////////////////
 
 ////////////////////////////////////////////////////////////

@@ -6,7 +6,16 @@
   </PropertyGroup>
 
   <ItemGroup>
+    
     <Compile Include="Program.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.SqlClient" Version="6.1.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\MMTS\MMTS.fsproj" />
   </ItemGroup>
 
 </Project>

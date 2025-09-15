@@ -2191,7 +2191,10 @@ into your Parse module.
 ///////////////////////////////////////////////////
 *****using Hooks to Prep for Engine1A
 
-Short answer: yes—I’m keeping the classic hooks (fetch/transform/materialize) fully intact, and adding exec steps alongside them. That means you can kick off “prep-work” for Engine1A and Engine1B using either hooks or execs (or both), then flow into the new engine0/Engine1B executables.
+Short answer: yes—I’m keeping the classic hooks (fetch/transform/materialize) fully intact, 
+and adding exec steps alongside them. That means you can kick off “prep-work” 
+for Engine1A and Engine1B using either hooks or execs (or both), 
+then flow into the new engine0/Engine1B executables.
 
 Here’s what that unlocks and what “prep-work” means in practice:
 

@@ -1,0 +1,72 @@
+﻿# Engine1B / S1B skeleton — emits alt-path signals and materializes
+name: "S1B_MMTS_ML"
+version: "1.0"
+
+params:
+  env: "${ENV:ASPNETCORE_ENVIRONMENT|dev}"
+  batchId: "${NOW:yyyy-MM-dd}"
+  dataFeed: "EOD5Secs"
+  impl: "v1"
+  connStr: "${ENV:MMTS_TEST_CONNSTR|Server=.;Database=S1_Signals;Trusted_Connection=True;Encrypt=False}"
+  signalName: "DOWNTREND_BETA"
+
+prepare:
+  s1b:
+    db:
+      schema: "dbo"
+      target: "S1B_AltSignals"
+    keys:
+      - "DataFeed"
+      - "Symbol"
+      - "StatName"
+      - "TradeDate"
+      - "SignalName"
+
+hooks:
+  s1b.emit:
+    module: "POC.Hooks.S1B.Emit.v1.Module"
+    func: "Run"
+    kind: "rows"
+
+steps:
+  - id: "s1b.emit"
+    in:
+      io: "none"
+    out:
+      io: "rows"
+    args:
+      env: "${param:env}"
+      impl: "${param:impl}"
+      batchId: "${param:batchId}"
+      dataFeed: "${param:dataFeed}"
+      signalName: "${param:signalName}"
+
+  - id: "s1b.materialize"
+    kind: "materialize"
+    in:
+      from: "s1b.emit"
+      io: "rows"
+    args:
+      connStr: "${param:connStr}"
+      db:
+        schema: "${prepare:s1b.db.schema}"
+        target: "${prepare:s1b.db.target}"
+      keys: "${prepare:s1b.keys}"
+      mode: "bulk_upsert"
+      pre_sql: |
+        -- optional pre-sql for S1B
+      post_sql: |
+        -- optional post-sql for S1B
+      validate:
+        nonempty: true
+        schema:
+          columns:
+            - name: "DataFeed";   type: "nvarchar"
+            - name: "Symbol";     type: "nvarchar"
+            - name: "StatName";   type: "nvarchar"
+            - name: "TradeDate";  type: "datetime"
+            - name: "SignalName"; type: "nvarchar"
+            - name: "Score";      type: "float"
+            - name: "Meta";       type: "nvarchar"
+        unique:
+          - ["DataFeed","Symbol","StatName","TradeDate","SignalName"]
